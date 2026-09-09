@@ -138,6 +138,18 @@ __global__ void k_gemm(const uint16_t* __restrict__ A, const uint16_t* __restric
     }
   }
 }
+static void dumpx(const uint16_t* d_x) {
+  static int xi = 0; static FILE* xf = 0;
+  const char* dxp = getenv("HALO_DUMP_X");
+  if (!dxp) return;
+  if (!xf) xf = fopen(dxp, "wb");
+  void* hb = malloc(512);
+  CK(hipMemcpy(hb, d_x, 512, hipMemcpyDeviceToHost));
+  int idx = xi++;
+  fwrite(&idx, 4, 1, xf);
+  fwrite(hb, 1, 512, xf);
+  free(hb);
+}
 static void gemm(const uint16_t* A, const uint16_t* W, uint16_t* C, int M, int N, int K) {
   dim3 b(16, 16);
   for (int m0 = 0; m0 < M; m0 += 96) {          // kernel supports M <= 96; chunk by m
@@ -1156,6 +1168,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     double tload = now_s() - tw;
 
     // ---- input layernorm ----
+    dumpx(d_x);
     k_rmsnorm<<<T, 256>>>(d_x, d_ln_in_all + (long)l * HID, d_ln1, HID, T, 1);
     CK(hipDeviceSynchronize());
 
@@ -1252,6 +1265,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
 
     // ---- MLP ----
+    dumpx(d_x);
     k_rmsnorm<<<T, 256>>>(d_x, d_ln_post_all + (long)l * HID, d_ln2, HID, T, 1);
     if (g_dbg) dbg_all("ln2", d_ln2, T, HID);
     { const char* dp = getenv("HALO_DUMP_LN2");
@@ -1295,6 +1309,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     if (getenv("HALO_TIME")) printf("  L%d load %.2fs compute %.2fs\n", l, tload, now_s() - tc);
   }
   if (want_logits) {
+    dumpx(d_x);
     k_rmsnorm<<<T, 256>>>(d_x, d_final_norm, d_ln1, HID, T, 1);
     if (T == 1 && d_wpool) k_gemv_bf16f<<<VOC, 256>>>(d_ln1, d_lmhead, d_logits, HID);
     else gemm_f32(d_ln1, d_lmhead, d_logits, T, VOC, HID);

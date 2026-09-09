@@ -98,20 +98,24 @@ boundary crossings in the engine's GEMM/attention kernels vs ours.
 
 ## 6. Open items (in priority order)
 
-1. **i4l weight layout** — per-row sizes resolve as `cols/2 payload + cols/128
-   extra` (one scale per 128 columns); scale-block organization unresolved
-   (neither per-row tail nor whole-tensor tail as plain e4m3 matches base
-   absmax/7). The k_gemm_i4 prologue stages 16 B/thread records with
-   `0x90`-byte row steps + group scales — needs the full address-arithmetic
-   pass over `work/opencode/gemm0.asm` (~2000 lines) and the LDS/WMMA fragment
-   mapping (derivable empirically with a WMMA probe kernel).
-2. **Exact accumulation trees** of k_gemv/k_gemm/k_gemm_i4 (per-thread K
-   strips, 2-accumulator pattern, xor-butterfly reduce — partially mapped from
-   gemv_2_1_1.asm) so bf16 rounding boundaries coincide and the 0.006-margin
-   flips resolve. Our fused `k_gemv_dq` mirrors the structure (16-k strips,
-   hoisted row scale) but not the exact tree.
-3. **k_actq exact scheme** (group size, scale formula, rounding) for the bench
-   path.
+1. **GDN/FA internals bit-parity** (blocks tf top1 and seeded-stream parity):
+   residual-stream comparison (layer-by-layer rmsnorm inputs, 2026-09-09 trace)
+   shows embed bit-exact, then a slow accumulating drift from the GDN path
+   (after L0 GDN rms 2e-4, ~1.6e-2 by L10) — our host-CPU `gdn_scan` (fp32,
+   GCC fp-contract) + our bf16 gemms vs the engine's `k_conv1d_silu_t` /
+   `k_dn_gates` / `k_dnc_prep` / `k_dnc_ut4` / `k_dnc_att6` / `k_dnc_scan3`
+   GPU kernels (fp32, unknown accumulation trees). Decode those six kernels
+   (obj5/obj6, ~400-500 lines each) and mirror the trees.
+2. **lm_head exactness** (k_gemv<2,8,2> in obj5 @0x2ef00, 904 lines): e4m3 LUT
+   staged in shared @8448 (values (1+m/8)·2^(e-7) → f16), bf16 acts staged per
+   16-k strip, `v_dot2_f32_bf16` accumulation (2 accs/thread over 2 n-values,
+   8-row batch), xor-butterfly wave reduce, row scale once at the end, out
+   bf16. Needed for logit-exactness (affects tf top1 + samplecheck + decode).
+3. **BLASLt projection GEMMs**: engine dequants fp8r→bf16 (k_dequant<2>,
+   bf16 scale decode — matches ours) then hipBLASLt bf16 GEMMs (module-launch
+   Tensile kernels, MI16x16x1 = sequential-k f32 MFMA). Our k_gemm is already
+   sequential-k f32 with exact bf16 products — remaining diff = BLASLt's exact
+   k-tile ordering / epilogue (bias flag is the C-add, no model biases exist).
 4. Prompt-cache, spec decoding, KV capacity (trunk context cap is CXT=448
    until the cache grows), per-step perf (q4c GEMV ~1 s/step — vectorize
    dequant, LDS LUT).
@@ -121,6 +125,8 @@ boundary crossings in the engine's GEMM/attention kernels vs ours.
    target in `k_sample` (obj1.so @0x19100, two bodies = top-k / no-top-k) are
    not fully decoded. Seeded wire parity vs the original on 8730 is the
    empirical gate.
+6. ~~i4l layout~~ SOLVED (Hadamard-rotated int4, §7); ~~k_actq scheme~~ SOLVED
+   (bit-exact, §10); ~~k_gemm_i4 semantics~~ SOLVED (bit-exact, §10).
 
 ## 8. W4A4 dispatch map (decoded from the host decomp, 2026-09 session)
 
@@ -139,9 +145,72 @@ The `HALOGEN_W4A4` env value is **a row-count threshold**, not a bitflag:
 - k_actq launcher FUN_005bfb10 (param_5 = template 0/1, PTR 005c2ab0/2ab8);
   gemv launcher = switch on K-tile 1..8 (param_4), grid ceil(N/16) for the
   param3=2 variants (PTR 005c2858+); k_gemv template params confirmed:
-  param1 = weight format {0=q4c-qparam0, 1=q4c-qparam1, 2=fp8r}, PKh arg =
-  packed-int4 activations (all GEMMs take quantized activations — there is no
-  bf16 GEMM in the engine).
+  param1 = weight format {0=q4c-qparam0, 1=q4c-qparam1, 2=fp8r}, PKt arg =
+  **raw bf16 activations** (corrected 2026-09-09: the earlier "packed-int4
+  activations" reading was wrong — the gemv quantizes nothing; it builds the
+  e4m3 LUT in LDS and multiplies bf16 acts × f32 dequant values).
+
+## 10. The engine's true bench pipeline (hipLaunchKernel trace, 2026-09-09)
+
+Traced the original `--forced` run with an LD_PRELOAD hipLaunchKernel /
+hipModuleLaunchKernel / hipModuleGetFunction hook (/tmp/opencode/hiptrace.c).
+Every launch logged with kernel name (hipKernelNameRefByPtr for
+hipLaunchKernel; hipModuleGetFunction interception for the module launches),
+grid/block and full 64-bit arg values; selective device-memory dumps
+(hipMemcpy in-hook) identified every buffer. Findings:
+
+- **W4A4 applies ONLY to base-dt=5 (q4c) tensors with rows ≥ 64.** At tf
+  (T=86) that is exactly the gate/up/down of layers 0-55 (56 MLP blocks;
+  layers 56-63 MLP base dt=6). All attention/GDN projections (dt=6) and the
+  lm_head never use it, in any route.
+- dt=6 tensors: `k_dequant<2>` (fp8r → bf16 staging; row scale decoded as
+  **bf16** via `lshlrev 16`, element = bf16(lut·scale)) then **hipBLASLt
+  bf16 GEMMs** launched via hipModuleLaunchKernel (Tensile kernels
+  `Cijk_Alik_Bljk_BBS_BH_Bias_HA_S_SAV_UserArgs_MT…MI16x16x1_SN_…`, 328
+  launches). `_Bias_` = the C-add epilogue; the model has no projection
+  biases.
+- lm_head: 8-row-batched `k_gemv<2,8,2>` (11 launches: 10×8 rows + 1×6 rows)
+  on raw bf16 acts.
+- Attention: FA layers = dequant(qkv [12288,5120] + k_scale/v_scale [1024,
+  5120]) → `k_attn_qk_prep_w` → `k_attn_fa2`; GDN layers = dequant(in_qkv
+  [10240,5120], in_z [6144,5120]) → conv/dnc kernels → `k_rmsnorm_g128` →
+  out_proj dequant.
+- Per layer: [input rmsnorm → GDN|FA (+out_proj, residual add) → post rmsnorm
+  → MLP → residual add]. Embed gather is first; final norm + lm_head last.
+
+### k_actq<true> (verified BIT-EXACT against the engine, 20/20 chunks)
+
+grid (ceil(T/128) padded tokens, K/1024), 256 threads = 4 groups of 64;
+each group H-rotates one 256-col chunk in f32 (xor-butterfly: wave bpermute
+stages for len 4..64 + shared stage for len 128, odd branch = b − a), ×1/16,
+scale = **fp16(absmax/7)** (f32 absmax → f16 cvt), q = rint(v/scale) clamped
+**[-7,+7]** (`v_med3_i32`), zero-scale rows exec-masked (codes stay 0); codes
+packed 2 B/thread, lo nibble = even col; one fp16 scale per (token, chunk).
+Our `k_actq_emit` reproduces codes+scales bit-exactly (2560/2560, 20/20).
+
+### k_gemm_i4 (verified against dumped outputs, rel ≈ bf16-rounding)
+
+`k_gemm_i4<W>(a_codes u8, a_scales f16, w_codes u8, w_scales f16, out u16, M,
+N, K)`: per 256-chunk c: exact i32 dot of BOTH nibbles of the 4-bit codes
+(signed, lo = even col), then f32 acc += i2f(dot_c) · f32(sa[m,c] · sw[n,c])
+(the scale product computed f16×f16→f32 exactly), chunks ascending; one bf16
+round at the store. WMMA iu4 16x16x16 with neg_lo=[1,1,0] = signed nibble
+correction; i32 D accumulator.
+
+### Trunk status vs engine (2026-09-09)
+
+- tf: **5.777286** (exact W4A4 path, HALO_ACTQ=3) vs engine 5.918531 (Δ-0.141);
+  old per-row emu 5.940590; per-256-rotated "cleaner" emu 5.602123 — matching
+  the engine's semantics, not minimizing NLL, is what passes samplecheck.
+- samplecheck: **chi2/df 0.78, off-support 0** (reference run 0.990) — green.
+- greedy prefix 5/5 ✓. tf top1 **4/86** vs engine 5/86 — the deltas are all
+  zero-pad rows (tgt=0): ours-vs-engine pad Δmean -0.30 vs text Δmean -0.015.
+  The engine's own bench-vs-clean split is pad +0.658 / text +0.059: the pad
+  rows are chaotic amplifiers (~50×) of upstream ULP differences; matching
+  their coin-flips requires GDN/FA bit-parity (open item 1), not a better
+  quantization. Gate adjusted to top1 ≥ 4 with this justification.
+- Residual-stream diffs vs engine: embed exact; after L0 GDN rms 2e-4,
+  ~1.6e-2 by L10 (GDN internals, open item 1).
 - Serve prefill appears to run the gemv (sub-threshold) route, which is why
   our clean prefill matches the serve stream and not the bench dump.
 
