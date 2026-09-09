@@ -573,7 +573,10 @@ static inline int fa_ord(int l)  { return l / 4; }             // layer idx -> F
 static int g_dbg = 0;
 static int g_steps = 0;
 static int g_bf16logits = 0;
-static int g_actq = 0;
+static int g_actq = 0;    // engine-default serve prefill is CLEAN; HALO_ACTQ=3 emulates
+                          // the forced-bench W4A4 prefill (mean-NLL 5.9406 vs 5.918531)
+static int g_dnprep = 1;  // 1: round l2normed q/k to bf16 (engine inter-kernel dtype)
+static int g_beta32 = 0;  // 0: beta stays f32 (k_dn_gates emits f32) — matches engine clean path
 static void dbg_all(const char* tag, const uint16_t* d_buf, long rows, long width) {
   static uint16_t tmp[TMAX * 17408];
   CK(hipMemcpy(tmp, d_buf, rows * width * 2, hipMemcpyDeviceToHost));
@@ -642,12 +645,14 @@ static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float*
       float qi = 1.0f / sqrtf(qs + EPS) * h_qscale, ki = 1.0f / sqrtf(ks + EPS);
       for (int i = 0; i < DK; i++) {
         // engine passes l2normed q/k between kernels in bf16 (k_dnc_prep -> k_dnc_scan)
-        Q[(long)t * DK + i] = h_bf16f(h_f32bf(Q[(long)t * DK + i] * qi));
-        K[(long)t * DK + i] = h_bf16f(h_f32bf(K[(long)t * DK + i] * ki));
+        float qv = Q[(long)t * DK + i] * qi, kv_ = K[(long)t * DK + i] * ki;
+        if (g_dnprep) { qv = h_bf16f(h_f32bf(qv)); kv_ = h_bf16f(h_f32bf(kv_)); }
+        Q[(long)t * DK + i] = qv; K[(long)t * DK + i] = kv_;
       }
       for (int i = 0; i < DV; i++) V[(long)t * DV + i] = h_bf16f(vp[i]);
       G[t] = -expf(al[hh]) * softplusf(af[(long)t * HV + hh] + dt[hh]);
       B[t] = 1.0f / (1.0f + expf(-bfv[(long)t * HV + hh]));   // k_dn_gates emits f32 beta
+      if (!g_beta32) B[t] = h_bf16f(h_f32bf(B[t]));
     }
     std::vector<float> vb((long)NP * DV), kb((long)NP * DK);
     for (int t = 0; t < NP; t++) {
@@ -874,6 +879,8 @@ int main(int argc, char** argv) {
   if (getenv("HALO_STEPS")) g_steps = 1;
   if (getenv("HALO_BF16LOG")) g_bf16logits = atoi(getenv("HALO_BF16LOG"));
   if (getenv("HALO_ACTQ")) g_actq = atoi(getenv("HALO_ACTQ"));
+  if (getenv("HALO_DNPREP")) g_dnprep = atoi(getenv("HALO_DNPREP"));
+  if (getenv("HALO_BETA32")) g_beta32 = atoi(getenv("HALO_BETA32"));
 
   int ndev; CK(hipGetDeviceCount(&ndev));
   if (ndev < 1) { printf("no HIP device\n"); return 1; }
@@ -1017,7 +1024,9 @@ int main(int argc, char** argv) {
   // 16-byte header {magic, 0, rows, 1}; rows of 16 B: {u32 pred, u32 tgt, f32 nll, i32 doc}
   int refrows = 0;
   static long refpred[256]; static long reftgt[256]; static float refnll[256];
-  { FILE* fd = fopen("/home/ronin/Projects/chlorine-server/work/opencode/forced-text.bin", "rb");
+  { const char* refdump = getenv("HALO_REFDUMP");
+    FILE* fd = fopen(refdump ? refdump :
+                     "/home/ronin/Projects/chlorine-server/work/opencode/forced-text.bin", "rb");
     if (!fd) { printf("no forced dump\n"); return 1; }
     uint8_t hdr[16]; if (fread(hdr, 1, 16, fd) != 16) { printf("dump hdr\n"); return 1; }
     refrows = hdr[8] | (hdr[9] << 8) | (hdr[10] << 16) | (hdr[11] << 24);
@@ -1082,7 +1091,8 @@ int main(int argc, char** argv) {
       // per-row top-8 ids/logprobs + tail, for comparison vs the HFD3 dump
       static float* rowbuf = (float*)malloc((long)VOC * 4);
       static int eids[256][8]; static float elps[256][8]; static float etail[256];
-      { FILE* fd = fopen("/tmp/forced-topk8.bin", "rb");
+      { const char* dump = getenv("HALO_TOPK8_DUMP");
+        FILE* fd = fopen(dump ? dump : "/tmp/forced-topk8.bin", "rb");
         if (fd) { fseek(fd, 0, SEEK_END); long fsz = ftell(fd); fseek(fd, 0, SEEK_SET);
           std::vector<uint8_t> raw(fsz); if (fread(raw.data(), 1, fsz, fd) == (size_t)fsz) {
             for (int i = 0; i < refrows; i++) {
