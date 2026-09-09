@@ -179,7 +179,9 @@ k_actq butterfly IS the fast Hadamard transform), so W'·a' = W·a exactly.
   EXACTLY (absmax/s = 7.000 at p1/p50/p99 on both tensors).
 - dequant: W'[n,k'] = code[n,k'] · s[n][k'>>8]
 - reconstruction: W[n, 256c:(c+1)·256] = W'[n, same] @ Hadamard256/16
-- gate_proj verification: corr 0.9922-0.9931 (rows 0-3), absmax/s = 7.000.
+- verified on down_proj (corr 0.9920-0.9924), gate_proj (0.9922-0.9931),
+  and linear_attn.in_proj_qkv (0.9917-0.9927); absmax/s = 7.000 exact on
+  all three — the layout is universal for every i4l tensor.
 
 **Shadow tensors**: every i4l tensor has a same-dims q4c (dt=5) twin
 (e.g. layers.0.mlp.down_proj.weight dt=5 + .weight.i4l dt=8). q4c =
