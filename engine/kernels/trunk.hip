@@ -22,7 +22,10 @@ static const int sc_ref_id[8] = {198, 271, 0, 729, 279, 2834, 561, 369};
 int samplecheck(int draws, int topk, float temp, float topp, float minp, int row) {
   static float lrow[248320];
   CK(hipMemcpy(lrow, d_logits + (long)row * VOC, (long)VOC * 4, hipMemcpyDeviceToHost));
-  // expected table: same filter pipeline as chlorine_sample_host, no RNG
+  // expected table: same filter pipeline as chlorine_sample_host, no RNG.
+  // Sampler first rounds logits to bf16 (engine logits are bf16); the expected
+  // table must see the same values or top-k membership can diverge on ties.
+  for (int v = 0; v < VOC; v++) lrow[v] = h_bf16f(h_f32bf(lrow[v]));
   chlorine_sample_opts o = {};
   o.has_sample = 1; o.temp = temp; o.top_k = topk; o.top_p = topp; o.min_p = minp;
   o.seed = 0;
