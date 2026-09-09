@@ -457,6 +457,102 @@ __global__ void k_had_cols(uint16_t* __restrict__ X) {
   X[base + tid] = f32bf(sh[tid] * (1.0f / 16.0f));
 }
 
+// W4A4 exact act-quant emission (engine k_actq<true> semantics, verified
+// bit-exact against the original): H-rotate the row's 256-chunk, scale =
+// fp16(absmax/7), q = rint(v/scale) clamped [-7,7], emit packed codes (lo nib
+// = even col) + one fp16 scale per (row, 256-chunk). Input NOT modified.
+__device__ inline uint16_t f32h(float x) {
+  uint32_t u = __float_as_uint(x);
+  uint32_t sign = (u >> 16) & 0x8000u;
+  int32_t e = (int32_t)((u >> 23) & 0xFFu) - 127 + 15;
+  uint32_t m = u & 0x7FFFFFu;
+  if (((u >> 23) & 0xFFu) == 255) return (uint16_t)(sign | 0x7C00u | (m ? 0x200u : 0));
+  if (e >= 31) return (uint16_t)(sign | 0x7C00u);
+  if (e <= 0) {
+    if (e < -10) return (uint16_t)sign;
+    m |= 0x800000u;
+    int sh = 14 - e;
+    uint32_t r = m >> sh, rem = m & ((1u << sh) - 1u), half = 1u << (sh - 1);
+    r += (rem > half || (rem == half && (r & 1))) ? 1u : 0u;
+    return (uint16_t)(sign | r);
+  }
+  uint32_t r = ((uint32_t)e << 10) | (m >> 13);
+  uint32_t rem = m & 0x1FFFu;
+  r += (rem > 0x1000u || (rem == 0x1000u && (r & 1))) ? 1u : 0u;
+  return (uint16_t)(sign | r);
+}
+
+__global__ void k_actq_emit(const uint16_t* __restrict__ X, uint8_t* __restrict__ C,
+                            uint16_t* __restrict__ S, long cols) {
+  __shared__ float sh[256], sm[256];
+  __shared__ uint8_t sc[256];
+  int tid = threadIdx.x;
+  long tok = blockIdx.x;
+  int chunk = blockIdx.y;
+  long base = tok * cols + (long)chunk * 256;
+  sh[tid] = bf16f(X[base + tid]);
+  __syncthreads();
+  for (int len = 1; len < 256; len <<= 1) {
+    float a = sh[tid], b = sh[tid ^ len];
+    __syncthreads();
+    sh[tid] = ((tid & len) ? b - a : a + b);
+    __syncthreads();
+  }
+  float v = sh[tid] * (1.0f / 16.0f);
+  sm[tid] = fabsf(v);
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (tid < off) sm[tid] = fmaxf(sm[tid], sm[tid + off]);
+    __syncthreads();
+  }
+  uint16_t sb = f32h(sm[0] / 7.0f);
+  float scale = fp16f(sb);
+  if (tid == 0) S[tok * (cols >> 8) + chunk] = sb;
+  float q = 0.f;
+  if (scale > 0.f) {                    // engine: exec-masked when scale == 0
+    q = rintf(v / scale);
+    q = fminf(fmaxf(q, -7.f), 7.f);
+  }
+  sc[tid] = (uint8_t)((int)q & 0xF);
+  __syncthreads();
+  if (tid < 128) C[tok * (cols >> 1) + chunk * 128 + tid] =
+      (uint8_t)(sc[2 * tid] | (sc[2 * tid + 1] << 4));
+}
+
+// Engine k_gemm_i4 semantics (verified vs dumped outputs): per 256-chunk exact
+// int dot of the 4-bit codes, scaled by f32(act_scale * weight_scale), f32
+// accumulated over chunks in ascending order, one bf16 round at the end.
+__global__ void k_gemm_i4emul(const uint8_t* __restrict__ ac, const uint16_t* __restrict__ as,
+                              const uint8_t* __restrict__ wc, const uint16_t* __restrict__ ws,
+                              uint16_t* __restrict__ C, int N, long K) {
+  int m = blockIdx.x;
+  int n = blockIdx.y * blockDim.x + threadIdx.x;
+  if (n >= N) return;
+  long per = K >> 1;
+  int nsc = (int)(K >> 8);
+  const uint8_t* arow = ac + (size_t)m * per;
+  const uint8_t* wrow = wc + (size_t)n * per;
+  const uint16_t* asr = as + (size_t)m * nsc;
+  const uint16_t* wsr = ws + (size_t)n * nsc;
+  __shared__ uint8_t sab[128];
+  float acc = 0.f;
+  for (int c = 0; c < nsc; c++) {
+    if (threadIdx.x < 128) sab[threadIdx.x] = arow[c * 128 + threadIdx.x];
+    __syncthreads();
+    const uint8_t* wp = wrow + c * 128;
+    int dot = 0;
+    #pragma unroll 8
+    for (int j = 0; j < 128; j++) {
+      uint8_t ab = sab[j], wb = wp[j];
+      dot += ((ab & 15) - ((ab & 8) << 1)) * ((wb & 15) - ((wb & 8) << 1))
+           + ((ab >> 4) - ((ab & 0x80) >> 3)) * ((wb >> 4) - ((wb & 0x80) >> 3));
+    }
+    acc += (float)dot * (fp16f(asr[c]) * fp16f(wsr[c]));
+    __syncthreads();
+  }
+  C[(size_t)m * N + n] = f32bf(acc);
+}
+
 // W4A4 exact act-quant emulation: H-rotate the row's 256-chunk, quantize
 // with chunk scale absmax/7, rotate back. X ends as H(quant(H x)).
 __global__ void k_actq_had(uint16_t* __restrict__ X) {
@@ -670,6 +766,13 @@ static bool pool_add(const char* name, long rows, long cols) {
 
 static int g_prefill = 0;  // 1 = multi-token forward: use Hadamard-rotated i4l weights
 
+static int gate_dt5(int l) {
+  char nm[176];
+  snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l);
+  const Ent* e = find(nm);
+  return e && e->dt == 5;
+}
+
 static void getw(const char* name, long rows, long cols, uint16_t* d_out) {
   auto it = g_wmap.find(name);
   if (it != g_wmap.end()) {
@@ -684,12 +787,34 @@ static void getw(const char* name, long rows, long cols, uint16_t* d_out) {
                                         d_out, cols);
     return;
   }
-  if (g_prefill) {
+  if (g_prefill && find(name)->dt == 5) {
+    // Only q4c-based tensors take the rotated-i4l W4A4 route (engine rule:
+    // base dt 5 -> i4l W4A4; base dt 6 (fp8r) -> dequant + bf16 GEMM).
     char nm2[176];
     snprintf(nm2, sizeof(nm2), "%s.i4l", name);
     if (try_find(nm2)) { load_i4l(nm2, rows, cols, d_out); return; }
   }
   load_auto(name, rows, cols, d_out);
+}
+
+// stream one i4l tensor's raw codes + fp16 scales to device staging buffers
+// (used by the exact W4A4 int-dot GEMM emulation; no dequant, no unrotation)
+static uint8_t* d_wc[3]; static uint16_t* d_ws[3];
+static void load_i4l_raw(const char* name, long rows, long cols, int slot) {
+  const Ent* e = find(name);
+  long per = cols >> 1;
+  long nsc = cols >> 8;
+  uint8_t* dc = d_wc[slot];
+  uint16_t* ds = d_ws[slot];
+  long chunk = (long)(24e6 / per); if (chunk < 1) chunk = 1;
+  for (long r0 = 0; r0 < rows; r0 += chunk) {
+    long nr = chunk < rows - r0 ? chunk : rows - r0;
+    rd(e->off + r0 * per, h_stage, (size_t)nr * per);
+    up(dc + r0 * per, h_stage, (size_t)nr * per);
+    rd(e->off + rows * per + r0 * nsc * 2, h_stage2, (size_t)nr * nsc * 2);
+    up((uint8_t*)(ds + r0 * nsc), h_stage2, (size_t)nr * nsc * 2);
+  }
+  CK(hipDeviceSynchronize());
 }
 
 // fused dequant GEMV (decode steps, M == 1): C[n] = sum_k A[k] * dequant(W[n][k]).
@@ -786,6 +911,7 @@ static uint16_t *d_qnorm, *d_knorm;
 static uint16_t *d_qkv, *d_z, *d_outp;
 static uint16_t *d_q, *d_k, *d_v, *d_o;
 static uint16_t *d_gate, *d_up, *d_down;
+static uint8_t* d_qc; static uint16_t* d_qs;
 static uint16_t *d_convstate;                 // [48][10240][3]
 static uint16_t *d_kcache, *d_vcache;         // [16][CXT][4][256]
 static uint16_t *d_x, *d_ln1, *d_ln2, *d_tmp1;
@@ -996,6 +1122,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     int fa = (l % 4 == 3);
     int gi = fa ? fa_ord(l) : gdn_ord(l);
     bool fused = (T == 1 && d_wpool);   // decode step: fused dequant-GEMV, no dequanted W
+    int w4 = g_actq && T >= 64 && d_wc[0] && gate_dt5(l);
     // ---- load weights for this layer (or fused from the pool) ----
     if (fa) {
       if (!fused) {
@@ -1012,9 +1139,18 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       }
     }
     if (!fused) {
-      snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); getw(nm, INTM, HID, d_gate);
-      snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   getw(nm, INTM, HID, d_up);
-      snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); getw(nm, HID, INTM, d_down);
+      if (w4) {
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight.i4l", l);
+        load_i4l_raw(nm, INTM, HID, 0);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight.i4l", l);
+        load_i4l_raw(nm, INTM, HID, 1);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight.i4l", l);
+        load_i4l_raw(nm, HID, INTM, 2);
+      } else {
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); getw(nm, INTM, HID, d_gate);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   getw(nm, INTM, HID, d_up);
+        snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); getw(nm, HID, INTM, d_down);
+      }
       CK(hipDeviceSynchronize());
     }
     double tload = now_s() - tw;
@@ -1118,8 +1254,24 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     // ---- MLP ----
     k_rmsnorm<<<T, 256>>>(d_x, d_ln_post_all + (long)l * HID, d_ln2, HID, T, 1);
     if (g_dbg) dbg_all("ln2", d_ln2, T, HID);
-    if (g_actq & 2) k_actq_had<<<(unsigned)((long)T * (HID / 256)), 256>>>(d_ln2);
-    if (fused) {
+    { const char* dp = getenv("HALO_DUMP_LN2");
+      if (dp && l == 0) { void* hb = malloc(TMAX * HID * 2);
+        CK(hipMemcpy(hb, d_ln2, 87L * HID * 2, hipMemcpyDeviceToHost));
+        FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 87L * HID * 2, f); fclose(f); free(hb); } }
+    if (w4) {
+      k_actq_emit<<<dim3(T, HID / 256), 256>>>(d_ln2, d_qc, d_qs, HID);
+      k_gemm_i4emul<<<dim3(T, INTM / 256), 256>>>(d_qc, d_qs, d_wc[0], d_ws[0], d_g17, INTM, HID);
+      k_gemm_i4emul<<<dim3(T, INTM / 256), 256>>>(d_qc, d_qs, d_wc[1], d_ws[1], d_u17, INTM, HID);
+      { const char* dp = getenv("HALO_DUMP_W4");
+        if (dp && l == 0) { CK(hipDeviceSynchronize());
+          void* hb = malloc(34816 * 2); void* hb2 = malloc(4096);
+          CK(hipMemcpy(hb, d_g17, 34816 * 2, hipMemcpyDeviceToHost));
+          CK(hipMemcpy(hb2, d_qc, 4096, hipMemcpyDeviceToHost));
+          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 34816 * 2, f);
+          fwrite(hb2, 1, 4096, f); fclose(f); free(hb); free(hb2);
+          CK(hipMemcpy(hb2, d_qs, 4096, hipMemcpyDeviceToHost));
+          f = fopen("/tmp/ours_qs.bin", "wb"); fwrite(hb2, 1, 4096, f); fclose(f); free(hb2); } }
+    } else if (fused) {
       snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); gemv_dq(d_ln2, nm, d_g17);
       snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   gemv_dq(d_ln2, nm, d_u17);
     } else {
@@ -1128,8 +1280,10 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     }
     if (g_dbg) { dbg_all("g17", d_g17, T, INTM); dbg_all("u17", d_u17, T, INTM); }
     k_silu_mul<<<GRID1((long)T * INTM), 256>>>(d_g17, d_u17, d_act, (long)T * INTM);
-    if (g_actq & 1) k_actq_had<<<(unsigned)((long)T * (INTM / 256)), 256>>>(d_act);
-    if (fused) {
+    if (w4) {
+      k_actq_emit<<<dim3(T, INTM / 256), 256>>>(d_act, d_qc, d_qs, INTM);
+      k_gemm_i4emul<<<dim3(T, HID / 256), 256>>>(d_qc, d_qs, d_wc[2], d_ws[2], d_tmp1, HID, INTM);
+    } else if (fused) {
       snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); gemv_dq(d_act, nm, d_tmp1);
     } else {
       gemm(d_act, d_down, d_tmp1, T, HID, INTM);
@@ -1258,6 +1412,12 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_gate, (long)INTM * HID * 2));
   CK(hipMalloc((void**)&d_up, (long)INTM * HID * 2));
   CK(hipMalloc((void**)&d_down, (long)HID * INTM * 2));
+  for (int i = 0; i < 3; i++) {
+    CK(hipMalloc((void**)&d_wc[i], (long)INTM * HID / 2 + 1024));
+    CK(hipMalloc((void**)&d_ws[i], (long)INTM * HID / 256 * 2 + 1024));
+  }
+  CK(hipMalloc((void**)&d_qc, (long)TMAX * INTM / 2 + 1024));
+  CK(hipMalloc((void**)&d_qs, (long)TMAX * (INTM / 256) * 2 + 1024));
 
   CK(hipMalloc((void**)&d_convstate, (long)48 * QKVW * 3 * 2));
   CK(hipMemset(d_convstate, 0, (long)48 * QKVW * 3 * 2));
