@@ -75,6 +75,75 @@ Layout: `[64-byte codebook][row 0: payload+scales][row 1: payload+scales]…`
   gemm0.asm, or a differential probe. Probes: /tmp/opencode/i4l_*.py.
 - qparam `0x10100` on every i4l tensor: exact field semantics `[OPEN]`.
 
+## WMMA iu4 fragment maps (empirical, 2026-09-09 probe)
+
+Derived with a raw-LLVM-IR probe kernel (`@llvm.amdgcn.wmma.i32.16x16x16.iu4`
+exists; compile `.ll` → `.o` with
+`clang -target amdgcn-amd-amdhsa -mcpu=gfx1151 -c`, then **`ld.lld -shared`**
+— hipModuleLoad requires a linked shared object, a bare relocatable fails with
+hipErrorNoKernelImageForDevice). Probes: /tmp/opencode/wmprobe3.ll,
+wmhost.cpp, wmscan.cpp, amap.cpp, joint.cpp + the *.bin dumps.
+
+- **D** (16×16 i32): cell (t′, i) = (m = i + 8·(t′≥16), n = t′&15); threads
+  16-31 idle in W32. (Confirmed by both A and B one-hot sweeps — the earlier
+  (m = t′&15, n = i+…) reading was wrong.)
+- **Shared k-encoding (confirmed by value-multiplication test, 2026-09-09
+  wmprobe6/wmhost8 sweep)**: operand position (thread T, vgpr V, nibble N)
+  ↔ k = 8·V + N for BOTH A and B; the 4-bit nibble = the element VALUE
+  (wmma reads nibble values, not bits). Setting bit J of a vgpr sets
+  nibble (J>>2) to value 2^(J&3); two operands multiply (D-cell val =
+  A-val × B-val) exactly when their (vgpr, nibble) positions match.
+- **A**: element (m, k) → thread T = m&15, vgpr k>>3, nibble k&7 — the
+  thread's 2 vgprs = one row's 16 k's ascending. Threads 16-31 idle.
+- **B**: element (k, n) → thread T = n&15, vgpr k>>3, nibble k&7 — the
+  thread's ENTIRE operand (2 vgprs = 16 k's) = the n-column's 16
+  consecutive k's (k = 16h..16h+15 for the h-th wmma k-step). Threads
+  16-31 idle. (Thread 0 = the n=0 column, confirmed over all (V, N).)
+
+**Consequence for i4l (REVISED 2026-09-09, later probe)**: the B operand is
+ONE weight row's 16 consecutive k's — so the staged/global record (16 B) is
+one n-row's k's [16h, +16) in ascending order and **the device weights are
+[N, K]-major natural** (row stride K/2 = 8704 ✓ s31). The engine reads the
+i4l bytes RAW (the host loader copies them; the per-row 4-B is de-skipped).
+The [K, N]-major and n-pair/k-half hypotheses are dead.
+
+**The failed round(W/s) tests are explained: the quantization is
+codebook/compensated, not linear.** Evidence:
+- magnitude multiset of file codes ≈ clip(round(W/s_file), ±7) but the
+  per-position pairing fails everywhere (sign-match 0.41 = random for
+  every row/k/row-permutation/k-shift/layout variant tested);
+- the scales decode as fp16 with a FIXED exponent 2^-8 (odd bytes
+  constant 0x1D) — i.e. 8-bit mantissa × 2^-8, values ≈ absmax/5.3-7.0
+  (looser than absmax/7 → outlier clipping);
+- file layout = 5120 rows × (4 B + 8704 B) + 5120 × 136 B tail; sizes
+  exact (45,260,800 = 5120·8708 + 5120·136);
+- the per-row 4-B decodes as 2 fp16 fixed-exp values ≈ scales × 1.11
+  (e.g. 0.00559, 0.00580) — same format as the scale block;
+- cross-row constraint solving (k must satisfy code[p] = round(W[n,k]/s)
+  for ALL n) yields ZERO candidates → the codes are per-row-compensated
+  (GPTQ-style) or LUT-mapped, NOT round(W/s).
+
+**Load-time dequant kernels (k_dequant<0/1/2> in obj5.so)** decode SOME
+weight dtypes to bf16 at load (the u16-typed weights in k_gemv = PKt):
+- `<2>`: payload = raw bytes → 256-entry e4m3 decode LUT built in LDS
+  (sign = tid<0x80, exp = (tid>>3)&15, man = tid&7, RNE→bf16), then
+  out = LUT[code] × fp16 scale (global_load_d16_b16), RNE→bf16 stores.
+  = the fp8r loader.
+- `<1>`: same shape but the 256-entry table is LOADED from arg0 (an
+  explicit in-file/in-model codebook, fp16 entries converted to bf16) —
+  byte codes + explicit codebook + fp16 scales.
+- `<0>` (732 B): unexamined; likely the 4-bit variant.
+- The forward dispatch switches on a global quant-mode (`DAT_005c4480`,
+  trailing-zero count): cases 2-8 = dequant-then-gemm variants, default =
+  the gemv path. 8 quant modes total.
+- Launchers: FUN_0056b310→k_dequant<0>, FUN_0056b3c0→<1>,
+  FUN_0056b490→<2> (grid ((n+3)/4, 40) — 40 = N/128 row-tiles).
+
+**Next step**: read k_dequant<0>'s 732 B — if it indexes a 16-entry LUT
+(arg0) that is one of the file sections, the i4l = LUT-int4 and the
+codebook location + the exact scale addressing fall out of its addressing
+math directly.
+
 ## Validation summary
 
 - fp8r: reproduced base-model row0 exactly (std 0.01735 / absmax 0.06885);
