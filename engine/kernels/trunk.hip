@@ -38,8 +38,8 @@ static const int   NPAIR = 32;        // rotary pairs (partial 0.25 -> 64 dims)
 static const float SCALE = 0.0625f;   // 1/sqrt(256)
 static const float THETA = 1e7f;
 static const float EPS   = 1e-6f;
-static const int   CXT   = 176;      // kv cache capacity (>= 174 u16-seq prefill, 87+24 decode)
-static const int   TMAX  = 176;      // activation rows
+static const int   CXT   = 448;      // kv cache capacity (>= 348 u16-seq prefill + 24 decode)
+static const int   TMAX  = 352;      // activation rows (>= 348 forced-seq)
 static const char* CKPT  = "/home/ronin/Projects/chlorine-server/models/qwen3.8-27b-p1w4d-d2.hgn";
 
 static int ROPE_MODE = 0;   // 0: HF half-split pairs (p, p+32); 1: interleaved (2p, 2p+1)
@@ -170,13 +170,14 @@ __global__ void k_rmsnorm(const uint16_t* __restrict__ X, const uint16_t* __rest
     O[(long)row * K + c] = f32bf(v * inv * wv);
   }
 }
-// per-head RMSNorm (zero-centered (1+w)): src row stride sstride, D elems/head; dst [T,heads,D]
+// per-head RMSNorm (zero-centered (1+w)): src row stride sstride, head h at offset
+// h*hstride (FA q_proj rows interleave [q_h | gate_h], so q needs hstride=2*D); dst [T,heads,D]
 __global__ void k_headnorm(const uint16_t* __restrict__ X, const uint16_t* __restrict__ w,
-                           uint16_t* __restrict__ O, int T, int heads, int sstride, int D) {
+                           uint16_t* __restrict__ O, int T, int heads, int sstride, int hstride, int D) {
   long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
   if (i >= (long)T * heads) return;
   int t = (int)(i / heads), h = (int)(i % heads);
-  const uint16_t* xp = X + (long)t * sstride + (long)h * D;
+  const uint16_t* xp = X + (long)t * sstride + (long)h * hstride;
   float ss = 0.f;
   for (int d = 0; d < D; d++) { float v = bf16f(xp[d]); ss += v * v; }
   float inv = rsqrtf(ss / (float)D + EPS);
@@ -255,8 +256,11 @@ __global__ void k_rope(uint16_t* __restrict__ X, long T, int heads, int pos_base
   int d1, d2;
   if (mode) { d1 = 2 * p; d2 = 2 * p + 1; } else { d1 = p; d2 = p + NPAIR; }
   float a1 = bf16f(xp[d1]), a2 = bf16f(xp[d2]);
-  xp[d1] = f32bf(a1 * cf - a2 * sf);
-  xp[d2] = f32bf(a2 * cf + a1 * sf);
+  // HF: (q_rot*cos) + (rotate_half(q_rot)*sin), each product and the sum rounded to bf16
+  float t1 = bf16f(f32bf(a1 * cf)), t2 = bf16f(f32bf(a2 * sf));
+  float t3 = bf16f(f32bf(a2 * cf)), t4 = bf16f(f32bf(a1 * sf));
+  xp[d1] = f32bf(t1 - t2);
+  xp[d2] = f32bf(t3 + t4);
 }
 
 // ---------------- KV cache write ----------------
@@ -370,6 +374,27 @@ __global__ void k_gdn_gatednorm(const uint16_t* __restrict__ CO, const uint16_t*
 }
 
 // ---------------- MLP act ----------------
+// engine-default W4A4: activations quantized before the q4c GEMMs (k_actq).
+// Emulate: symmetric int4 grid, per-row bf16 scale, RNE round, then dequant to bf16.
+__global__ void k_actq(uint16_t* __restrict__ X, int K, int mode) {
+  // one block per row
+  __shared__ float sh[256];
+  int tid = threadIdx.x;
+  const uint16_t* row = X + (long)blockIdx.x * K;
+  float am = 0.f;
+  for (int c = tid; c < K; c += 256) { float v = bf16f(row[c]); am = fmaxf(am, fabsf(v)); }
+  sh[tid] = am; __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) { if (tid < off) sh[tid] = fmaxf(sh[tid], sh[tid + off]); __syncthreads(); }
+  float scale = bf16f(f32bf(sh[0] / 7.0f));
+  if (scale <= 0.f) scale = 1.0f;
+  uint16_t* orow = X + (long)blockIdx.x * K;
+  for (int c = tid; c < K; c += 256) {
+    float v = bf16f(orow[c]);
+    float q = rintf(v / scale);
+    q = fminf(fmaxf(q, -8.f), 7.f);
+    orow[c] = f32bf(q * scale);
+  }
+}
 __global__ void k_silu_mul(const uint16_t* __restrict__ G, const uint16_t* __restrict__ U,
                            uint16_t* __restrict__ Hh, long n) {
   long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
@@ -381,6 +406,11 @@ __global__ void k_silu_mul(const uint16_t* __restrict__ G, const uint16_t* __res
 }
 
 // ---------------- logits reduction ----------------
+__global__ void k_bf16logits(float* Lg, long n) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  Lg[i] = bf16f(f32bf(Lg[i]));
+}
 __global__ void k_topnll(const float* __restrict__ Lg, const int* __restrict__ rowmap,
                          const int* __restrict__ tgt, int* __restrict__ pred, float* __restrict__ nll,
                          int V, long T) {
@@ -542,8 +572,10 @@ static inline int fa_ord(int l)  { return l / 4; }             // layer idx -> F
 
 static int g_dbg = 0;
 static int g_steps = 0;
+static int g_bf16logits = 0;
+static int g_actq = 0;
 static void dbg_all(const char* tag, const uint16_t* d_buf, long rows, long width) {
-  static uint16_t tmp[112 * 24832];
+  static uint16_t tmp[TMAX * 17408];
   CK(hipMemcpy(tmp, d_buf, rows * width * 2, hipMemcpyDeviceToHost));
   double mx = 0, sm = 0; long nan = 0;
   for (long i = 0; i < rows * width; i++) {
@@ -581,48 +613,124 @@ static void dbg_f32(const char* tag, const float* d_buf, long row, long width) {
          tag, sm / width, mx, nan, tmp[0], tmp[1], tmp[2], tmp[3]);
 }
 
-// GDN sequential delta-rule scan (f32, host). S[ord][h][k][v] persists across calls.
+// GDN: fla-style CHUNKED gated delta rule (f32, host), chunk 64.
+// Spec: torch_chunk_gated_delta_rule in qwen35_ref.py (the engine runs k_dnc_ut/scan
+// kernels — the chunked algorithm; the sequential form is numerically different).
 static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float* bfv,
                      int ord, uint16_t* out) {
   const float* al = h_alog + (long)ord * HV;
   const float* dt = h_dtbias + (long)ord * HV;
+  const int CS = 64;
+  const int nch = (T + CS - 1) / CS;
+  const int NP = nch * CS;
 #ifdef _OPENMP
   #pragma omp parallel for schedule(static)
 #endif
   for (int hh = 0; hh < HV; hh++) {
     float* S = h_S + ((long)ord * HV + hh) * DK * DV;
-    float q[DK], k[DK], v[DV], delta[DV], kv[DV];
+    std::vector<float> Q((long)NP * DK, 0.f), K((long)NP * DK, 0.f), V((long)NP * DV, 0.f);
+    std::vector<float> G(NP, 0.f), B(NP, 0.f);
     for (int t = 0; t < T; t++) {
       const uint16_t* qp = qkvbf + (long)t * QKVW + (hh / 3) * DK;
       const uint16_t* kp = qkvbf + (long)t * QKVW + HK * DK + (hh / 3) * DK;
       const uint16_t* vp = qkvbf + (long)t * QKVW + HK * DK * 2 + hh * DV;
       float qs = 0.f, ks = 0.f;
       for (int i = 0; i < DK; i++) {
-        float a = h_bf16f(qp[i]); q[i] = a; qs += a * a;
-        float b = h_bf16f(kp[i]); k[i] = b; ks += b * b;
+        float a = h_bf16f(qp[i]); Q[(long)t * DK + i] = a; qs += a * a;
+        float b = h_bf16f(kp[i]); K[(long)t * DK + i] = b; ks += b * b;
       }
-      float qi = rsqrtf(qs + EPS) * h_qscale, ki = rsqrtf(ks + EPS);
-      for (int i = 0; i < DK; i++) { q[i] *= qi; k[i] *= ki; }
-      for (int i = 0; i < DV; i++) v[i] = h_bf16f(vp[i]);
-      float g = -expf(al[hh]) * softplusf(af[(long)t * HV + hh] + dt[hh]);
-      float beta = h_bf16f(h_f32bf(1.0f / (1.0f + expf(-bfv[(long)t * HV + hh]))));
-      float decay = expf(g);
-      for (int j = 0; j < DV; j++) {
-        float s = 0.f;
-        for (int i = 0; i < DK; i++) { float* Sp = S + (long)i * DV + j; *Sp *= decay; s += *Sp * k[i]; }
-        kv[j] = s;
-      }
-      for (int j = 0; j < DV; j++) delta[j] = (v[j] - kv[j]) * beta;
+      float qi = 1.0f / sqrtf(qs + EPS) * h_qscale, ki = 1.0f / sqrtf(ks + EPS);
       for (int i = 0; i < DK; i++) {
-        float kk_ = k[i];
-        float* Sp = S + (long)i * DV;
-        for (int j = 0; j < DV; j++) Sp[j] += kk_ * delta[j];
+        // engine passes l2normed q/k between kernels in bf16 (k_dnc_prep -> k_dnc_scan)
+        Q[(long)t * DK + i] = h_bf16f(h_f32bf(Q[(long)t * DK + i] * qi));
+        K[(long)t * DK + i] = h_bf16f(h_f32bf(K[(long)t * DK + i] * ki));
       }
-      uint16_t* op = out + (long)t * (HV * DV) + hh * DV;
-      for (int j = 0; j < DV; j++) {
-        float s = 0.f;
-        for (int i = 0; i < DK; i++) s += S[(long)i * DV + j] * q[i];
-        op[j] = h_f32bf(s);
+      for (int i = 0; i < DV; i++) V[(long)t * DV + i] = h_bf16f(vp[i]);
+      G[t] = -expf(al[hh]) * softplusf(af[(long)t * HV + hh] + dt[hh]);
+      B[t] = 1.0f / (1.0f + expf(-bfv[(long)t * HV + hh]));   // k_dn_gates emits f32 beta
+    }
+    std::vector<float> vb((long)NP * DV), kb((long)NP * DK);
+    for (int t = 0; t < NP; t++) {
+      for (int i = 0; i < DV; i++) vb[(long)t * DV + i] = V[(long)t * DV + i] * B[t];
+      for (int i = 0; i < DK; i++) kb[(long)t * DK + i] = K[(long)t * DK + i] * B[t];
+    }
+    std::vector<float> pd((long)CS * CS), ut((long)CS * CS), intra((long)CS * CS);
+    std::vector<float> nv((long)CS * DV), kcd((long)CS * DK), qd((long)CS * DK), kd((long)CS * DK);
+    std::vector<float> vn((long)CS * DV), inter((long)CS * DV), cum(CS);
+    for (int c = 0; c < nch; c++) {
+      int t0 = c * CS;
+      { float acc = 0.f;
+        for (int a = 0; a < CS; a++) { acc += G[t0 + a]; cum[a] = acc; } }
+      for (int a = 0; a < CS; a++) {
+        for (int b = 0; b < CS; b++) {
+          float p = b <= a ? expf(cum[a] - cum[b]) : 0.f;
+          pd[(long)a * CS + b] = p;
+          float kbd = 0.f, qkd = 0.f;
+          if (p != 0.f) {
+            const float* kba = &kb[(long)(t0 + a) * DK];
+            const float* kb2 = &K[(long)(t0 + b) * DK];
+            const float* qa = &Q[(long)(t0 + a) * DK];
+            for (int i = 0; i < DK; i++) { kbd += kba[i] * kb2[i]; qkd += qa[i] * kb2[i]; }
+          }
+          ut[(long)a * CS + b] = kbd * p;
+          intra[(long)a * CS + b] = qkd * p;
+        }
+      }
+      // unitriangular forward substitution: x[a] = b[a] - sum_{s<a} ut[a][s] x[s]
+      for (int a = 0; a < CS; a++) {
+        for (int j = 0; j < DV; j++) {
+          float s = vb[(long)(t0 + a) * DV + j];
+          for (int sc = 0; sc < a; sc++) s -= ut[(long)a * CS + sc] * nv[(long)sc * DV + j];
+          nv[(long)a * DV + j] = s;
+        }
+        const float* kba = &kb[(long)(t0 + a) * DK];
+        float ec = expf(cum[a]);
+        for (int i = 0; i < DK; i++) { kcd[(long)a * DK + i] = kba[i] * ec; qd[(long)a * DK + i] = Q[(long)(t0 + a) * DK + i] * ec; }
+        float ecd = expf(cum[CS - 1] - cum[a]);
+        for (int i = 0; i < DK; i++) kd[(long)a * DK + i] = K[(long)(t0 + a) * DK + i] * ecd;
+      }
+      for (int a = 1; a < CS; a++) {
+        for (int sc = 0; sc < a; sc++) {
+          float u = ut[(long)a * CS + sc];
+          const float* kcs = &kcd[(long)sc * DK];
+          float* kca = &kcd[(long)a * DK];
+          for (int i = 0; i < DK; i++) kca[i] -= u * kcs[i];
+        }
+      }
+      const float cdec = expf(cum[CS - 1]);
+      for (int a = 0; a < CS; a++) {
+        const float* kca = &kcd[(long)a * DK];
+        const float* qda = &qd[(long)a * DK];
+        for (int j = 0; j < DV; j++) {
+          float s1 = 0.f, s2 = 0.f;
+          for (int i = 0; i < DK; i++) { s1 += kca[i] * S[(long)i * DV + j]; s2 += qda[i] * S[(long)i * DV + j]; }
+          vn[(long)a * DV + j] = nv[(long)a * DV + j] - s1;
+          inter[(long)a * DV + j] = s2;
+        }
+        for (int b = 0; b <= a; b++) {
+          float w = intra[(long)a * CS + b];
+          if (w == 0.f) continue;
+          const float* vb2 = &vn[(long)b * DV];
+          for (int j = 0; j < DV; j++) inter[(long)a * DV + j] += w * vb2[j];
+        }
+      }
+      for (int a = 0; a < CS; a++)
+        for (int j = 0; j < DV; j++) {
+          int t = t0 + a;
+          if (t < T) out[(long)t * (HV * DV) + hh * DV + j] = h_f32bf(inter[(long)a * DV + j]);
+        }
+      for (int i = 0; i < DK; i++) {
+        float* Sp = S + (long)i * DV;
+        for (int j = 0; j < DV; j++) Sp[j] *= cdec;
+      }
+      for (int a = 0; a < CS; a++) {
+        const float* kda = &kd[(long)a * DK];
+        const float* va = &vn[(long)a * DV];
+        for (int i = 0; i < DK; i++) {
+          float kk_ = kda[i];
+          float* Sp = S + (long)i * DV;
+          for (int j = 0; j < DV; j++) Sp[j] += kk_ * va[j];
+        }
       }
     }
   }
@@ -710,8 +818,8 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       gemm(d_ln1, d_q, d_qg, T, QH * HD * 2, HID);
       gemm(d_ln1, d_k, d_kk, T, KVH * HD, HID);
       gemm(d_ln1, d_v, d_vv, T, KVH * HD, HID);
-      k_headnorm<<<GRID1((long)T * QH), 256>>>(d_qg, d_qnorm + (long)gi * HD, d_qn, T, QH, QH * HD * 2, HD);
-      k_headnorm<<<GRID1((long)T * KVH), 256>>>(d_kk, d_knorm + (long)gi * HD, d_kn, T, KVH, KVH * HD, HD);
+      k_headnorm<<<GRID1((long)T * QH), 256>>>(d_qg, d_qnorm + (long)gi * HD, d_qn, T, QH, QH * HD * 2, HD * 2, HD);
+      k_headnorm<<<GRID1((long)T * KVH), 256>>>(d_kk, d_knorm + (long)gi * HD, d_kn, T, KVH, KVH * HD, HD, HD);
       k_rope<<<GRID1((long)T * QH * NPAIR), 256>>>(d_qn, T, QH, pos_base, ROPE_MODE);
       k_rope<<<GRID1((long)T * KVH * NPAIR), 256>>>(d_kn, T, KVH, pos_base, ROPE_MODE);
       uint16_t* kc = d_kcache + (long)gi * CXT * KVH * HD;
@@ -734,10 +842,12 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     // ---- MLP ----
     k_rmsnorm<<<T, 256>>>(d_x, d_ln_post_all + (long)l * HID, d_ln2, HID, T, 1);
     if (g_dbg) dbg_all("ln2", d_ln2, T, HID);
+    if (g_actq & 2) k_actq<<<T, 256>>>(d_ln2, HID, 0);
     gemm(d_ln2, d_gate, d_g17, T, INTM, HID);
     gemm(d_ln2, d_up, d_u17, T, INTM, HID);
     if (g_dbg) { dbg_all("g17", d_g17, T, INTM); dbg_all("u17", d_u17, T, INTM); }
     k_silu_mul<<<GRID1((long)T * INTM), 256>>>(d_g17, d_u17, d_act, (long)T * INTM);
+    if (g_actq & 1) k_actq<<<T, 256>>>(d_act, INTM, 0);
     gemm(d_act, d_down, d_tmp1, T, HID, INTM);
     if (g_dbg) { dbg_all("mlp_act", d_act, T, INTM); dbg_all("mlp_out", d_tmp1, T, HID); }
     k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
@@ -748,6 +858,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
   if (want_logits) {
     k_rmsnorm<<<T, 256>>>(d_x, d_final_norm, d_ln1, HID, T, 1);
     gemm_f32(d_ln1, d_lmhead, d_logits, T, VOC, HID);
+    if (g_bf16logits) k_bf16logits<<<GRID1((long)T * VOC), 256>>>(d_logits, (long)T * VOC);
     CK(hipDeviceSynchronize());
     if (g_dbg) { printf("final:\n"); dbg_row("finalnorm", d_ln1, 0, HID); dbg_f32("logits", d_logits, 0, VOC); }
   } else {
@@ -761,6 +872,8 @@ int main(int argc, char** argv) {
   if (getenv("HALO_ROPE")) ROPE_MODE = atoi(getenv("HALO_ROPE"));
   if (getenv("HALO_DEBUG")) g_dbg = 1;
   if (getenv("HALO_STEPS")) g_steps = 1;
+  if (getenv("HALO_BF16LOG")) g_bf16logits = atoi(getenv("HALO_BF16LOG"));
+  if (getenv("HALO_ACTQ")) g_actq = atoi(getenv("HALO_ACTQ"));
 
   int ndev; CK(hipGetDeviceCount(&ndev));
   if (ndev < 1) { printf("no HIP device\n"); return 1; }
@@ -900,30 +1013,7 @@ int main(int argc, char** argv) {
     }
     printf("prompt: %d tokens\n", h_nprompt);
   }
-  up(d_tok, h_prompt, h_nprompt * 4);
-
-  // ================= prefill =================
-  double tp = now_s();
-  int cmp_mode = 0;   // 0: none, 1: u16-seq mapping (rows 4i+3), 2: i32 mapping (rows i)
-  if (strcmp(mode, "tf") == 0) {
-    // The original --forced reads the 348-byte prompt_ids tensor as u16 tokens:
-    // seq = [p0, hi0, p1, hi1, ...] (+ zero padding), dump row i = position 4i+3,
-    // tgt = seq[4i+4]. Reproduce exactly that.
-    static int seq[TMAX];
-    for (int k = 0; k < h_nprompt; k++) {
-      seq[2 * k] = h_prompt[k] & 0xFFFF;
-      seq[2 * k + 1] = (h_prompt[k] >> 16) & 0xFFFF;
-    }
-    up(d_tok, seq, 174 * 4);
-    forward(d_tok, 174, 0, 1);
-    cmp_mode = 1;
-  } else {
-    forward(d_tok, h_nprompt, 0, 1);
-    cmp_mode = 2;
-  }
-  printf("prefill: %.1fs\n", now_s() - tp);
-
-  // ---- teacher-forced reference (HFD2 dump from the original engine) ----
+  // ---- forced-dump reference (HFD2 dump from the original engine) ----
   // 16-byte header {magic, 0, rows, 1}; rows of 16 B: {u32 pred, u32 tgt, f32 nll, i32 doc}
   int refrows = 0;
   static long refpred[256]; static long reftgt[256]; static float refnll[256];
@@ -939,72 +1029,102 @@ int main(int argc, char** argv) {
     }
     fclose(fd);
   }
-  static int mytgt[256]; static int myrow[256];
-  int nvalid = 0;
-  for (int i = 0; i < refrows; i++) {
-    if (reftgt[i] != 0 && reftgt[i] < VOC) {
-      if (cmp_mode == 1) { myrow[nvalid] = 4 * i + 3; mytgt[nvalid] = h_prompt[2 * i + 2]; }
-      else               { myrow[nvalid] = i; mytgt[nvalid] = h_prompt[i + 1]; }
-      nvalid++;
-    }
-  }
-  printf("HFD2 rows=%d, valid rows=%d (cmp_mode=%d)\n", refrows, nvalid, cmp_mode);
-  up(d_tgt, mytgt, nvalid * 4);
-  up(d_tok, myrow, nvalid * 4);   // reuse d_tok as rowmap
-  k_topnll<<<nvalid, 256>>>(d_logits, d_tok, d_tgt, d_pred, d_nll, VOC, nvalid);
-  CK(hipDeviceSynchronize());
-  static int mypred[256]; static float mynll[256];
-  CK(hipMemcpy(mypred, d_pred, nvalid * 4, hipMemcpyDeviceToHost));
-  CK(hipMemcpy(mynll, d_nll, nvalid * 4, hipMemcpyDeviceToHost));
 
-  int top1 = 0, first_div = -1;
-  double nllsum = 0, refsum = 0, refsum86 = 0;
-  int reftop1_86 = 0;
-  for (int i = 0; i < refrows; i++) {
-    refsum86 += refnll[i];
-    if (refpred[i] == reftgt[i]) reftop1_86++;
+  // ================= prefill =================
+  double tp = now_s();
+  int is_tf = (strcmp(mode, "tf") == 0);
+  if (is_tf) {
+    // The original --forced (FUN_0058c4a0) reads the prompt_ids tensor as an i32
+    // vector at 8-BYTE STRIDE (i64 elements): the effective sequence is
+    // prompt[0], prompt[2], prompt[4], ... (44 tokens), then zeros past the
+    // 348-byte tensor (43 zeros) = 87 tokens. Single window (W=128), teacher
+    // forced, ALL 86 next-token rows dumped: row i = position i, tgt = seq[i+1].
+    static int seq[TMAX];
+    memset(seq, 0, sizeof(seq));
+    for (int j = 0; 2 * j < h_nprompt; j++) seq[j] = h_prompt[2 * j];
+    up(d_tok, seq, 87 * 4);
+    forward(d_tok, 87, 0, 1);
+  } else {
+    up(d_tok, h_prompt, h_nprompt * 4);
+    forward(d_tok, h_nprompt, 0, 1);
   }
-  for (int i = 0; i < nvalid; i++) {
-    nllsum += mynll[i]; refsum += refnll[i];
-    if (mypred[i] == mytgt[i]) top1++;
-    else if (first_div < 0) first_div = i;
-  }
-  printf("== teacher-forced ==\n");
-  printf("valid=%d top1=%d/%d (ref raw: %d/86) mean-NLL ours=%.6f ref=%.6f delta=%.6f first_div_row=%d\n",
-         nvalid, top1, nvalid, reftop1_86, nllsum / nvalid, refsum / nvalid,
-         nllsum / nvalid - refsum / nvalid, first_div);
-  printf("ref full-dump mean-NLL=%.6f (task ground truth 5.918531)\n", refsum86 / refrows);
-  for (int i = 0; i < 6; i++)
-    printf("  row%2d ourpos=%3d ours: pred=%d nll=%.4f | ref: pred=%ld tgt=%ld nll=%.4f\n",
-           i, myrow[i], mypred[i], mynll[i], refpred[i], reftgt[i], refnll[i]);
-  if (cmp_mode == 2 && nvalid > 0) {
-    // HFD2 rows are MTP-head drafts at even positions; the pred column should track
-    // the TRUNK argmax at position 2i. Check that (trunk-vs-trunk vs the original).
-    static int evenrow[256], eventgt[256];
-    int ne = 0;
+  printf("prefill: %.1fs\n", now_s() - tp);
+
+  if (is_tf) {
+    static int myrow[256], mytgt[256];
+    for (int i = 0; i < refrows; i++) { myrow[i] = i; mytgt[i] = (int)reftgt[i]; }
+    up(d_tgt, mytgt, refrows * 4);
+    up(d_tok, myrow, refrows * 4);   // reuse d_tok as rowmap
+    k_topnll<<<refrows, 256>>>(d_logits, d_tok, d_tgt, d_pred, d_nll, VOC, refrows);
+    CK(hipDeviceSynchronize());
+    static int mypred[256]; static float mynll[256];
+    CK(hipMemcpy(mypred, d_pred, refrows * 4, hipMemcpyDeviceToHost));
+    CK(hipMemcpy(mynll, d_nll, refrows * 4, hipMemcpyDeviceToHost));
+
+    int top1 = 0, pmatch = 0, first_pdiv = -1;
+    double nllsum = 0, refsum86 = 0;
+    unsigned long long hsh = 0x014650fb0739d0383ULL;
     for (int i = 0; i < refrows; i++) {
-      if (reftgt[i] != 0 && reftgt[i] < VOC && 2 * i + 2 < h_nprompt) {
-        evenrow[ne] = 2 * i;
-        eventgt[ne] = h_prompt[2 * i + 2];
-        ne++;
+      refsum86 += refnll[i];
+      nllsum += mynll[i];
+      if (mypred[i] == mytgt[i]) top1++;
+      if (mypred[i] == (int)refpred[i]) pmatch++;
+      else if (first_pdiv < 0) first_pdiv = i;
+      hsh = (hsh ^ (unsigned)mypred[i]) * 0x100000001b3ULL;
+    }
+    hsh &= 0xFFFFFFFFFFFFULL;
+    printf("== teacher-forced (even-token seq + zero pad, 87 tok, rows @ pos i) ==\n");
+    printf("rows=%d predmatch=%d/%d first_pred_div=%d top1=%d/%d (ref 5/86, hash %012llx)\n",
+           refrows, pmatch, refrows, first_pdiv, top1, refrows, hsh);
+    printf("mean-NLL ours=%.6f ref=%.6f (ground truth 5.918531) delta=%+.6f\n",
+           nllsum / refrows, refsum86 / refrows, nllsum / refrows - refsum86 / refrows);
+    if (getenv("HALO_TOPK8")) {
+      // per-row top-8 ids/logprobs + tail, for comparison vs the HFD3 dump
+      static float* rowbuf = (float*)malloc((long)VOC * 4);
+      static int eids[256][8]; static float elps[256][8]; static float etail[256];
+      { FILE* fd = fopen("/tmp/forced-topk8.bin", "rb");
+        if (fd) { fseek(fd, 0, SEEK_END); long fsz = ftell(fd); fseek(fd, 0, SEEK_SET);
+          std::vector<uint8_t> raw(fsz); if (fread(raw.data(), 1, fsz, fd) == (size_t)fsz) {
+            for (int i = 0; i < refrows; i++) {
+              const uint8_t* r = raw.data() + 24 + (size_t)i * 84;
+              memcpy(eids[i], r + 16, 32); memcpy(elps[i], r + 48, 32); memcpy(&etail[i], r + 80, 4);
+            }
+          } fclose(fd); }
+      }
+      for (int i = 0; i < refrows; i++) {
+        CK(hipMemcpy(rowbuf, d_logits + (long)myrow[i] * VOC, (long)VOC * 4, hipMemcpyDeviceToHost));
+        int ti[8]; float tv[8];
+        for (int j = 0; j < 8; j++) { ti[j] = -1; tv[j] = -3.0e38f; }
+        double lse = 0; float mx = -3.0e38f;
+        for (int v = 0; v < VOC; v++) if (rowbuf[v] > mx) mx = rowbuf[v];
+        double sm = 0;
+        for (int v = 0; v < VOC; v++) sm += exp((double)rowbuf[v] - mx);
+        lse = mx + log(sm);
+        for (int v = 0; v < VOC; v++) {
+          float x = rowbuf[v];
+          if (x > tv[7]) {
+            int j = 7; while (j > 0 && x > tv[j - 1]) { tv[j] = tv[j - 1]; ti[j] = ti[j - 1]; j--; }
+            tv[j] = x; ti[j] = v;
+          }
+        }
+        double p8 = 0;
+        for (int j = 0; j < 8; j++) p8 += exp((double)tv[j] - lse);
+        printf("TOPK8 row%2d ours:", i);
+        for (int j = 0; j < 8; j++) printf(" %d/%.4f", ti[j], (float)(tv[j] - lse));
+        printf(" | tail=%.4f\n", (float)log(1.0 - p8));
+        printf("TOPK8 row%2d  ref:", i);
+        for (int j = 0; j < 8; j++) printf(" %d/%.4f", eids[i][j], elps[i][j]);
+        printf(" | tail=%.4f\n", etail[i]);
       }
     }
-    up(d_tgt, eventgt, ne * 4);
-    up(d_tok, evenrow, ne * 4);
-    k_topnll<<<ne, 256>>>(d_logits, d_tok, d_tgt, d_pred, d_nll, VOC, ne);
-    CK(hipDeviceSynchronize());
-    static int epred[256];
-    CK(hipMemcpy(epred, d_pred, ne * 4, hipMemcpyDeviceToHost));
-    int pm = 0, fdiv = -1;
-    for (int i = 0; i < ne; i++) {
-      if (epred[i] == refpred[i]) pm++;
-      else if (fdiv < 0) fdiv = i;
+    for (int i = 0; i < refrows; i++) {
+      if (i < 10 || fabs(mynll[i] - refnll[i]) > 0.05)
+        printf("  row%2d pos%3d ours: pred=%6d nll=%8.4f | ref: pred=%6ld tgt=%6ld nll=%8.4f d=%+7.4f\n",
+               i, i, mypred[i], mynll[i], refpred[i], reftgt[i], refnll[i], mynll[i] - refnll[i]);
     }
-    printf("trunk-argmax@even-pos vs HFD2 pred column: %d/%d match, first_div=%d\n", pm, ne, fdiv);
+    printf("total elapsed: %.1fs\n", now_s() - t0);
+    return 0;
   }
-  printf("total elapsed: %.1fs\n", now_s() - t0);
-
-  if (strcmp(mode, "tf") == 0) return 0;
 
   // ================= greedy decode =================
   static const int target[24] = {271, 51, 1618, 579, 1558, 369, 524, 15756, 264, 13263, 38896, 13,
