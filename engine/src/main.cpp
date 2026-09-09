@@ -1,7 +1,9 @@
 // main.cpp — chlorine-server engine entry point.
-// Modes this skeleton implements: --checkpoint/--build-info/--serve.
-// The generator is a deterministic stub so the wire protocol is testable
-// without a GPU; the model backend replaces it in later phases.
+// Modes: --checkpoint/--build-info/--serve. With a GPU trunk available the GEN
+// handler runs the real model (prefill + greedy argmax decode); the sampler
+// (temp/top-k/top-p) is the next phase and is rejected until then. Without a
+// trunk (no GPU / no checkpoint) a deterministic stub keeps the wire protocol
+// testable.
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -15,6 +17,84 @@
 using namespace chlorine;
 
 namespace {
+
+// HIP trunk backend (engine/src/generator.hip), compiled with hipcc when present.
+extern "C" {
+int chlorine_trunk_init(const char* ckpt_path);
+int chlorine_trunk_generate(const int* prompt, int n_prompt, long max_tokens,
+                            const int* eos, int n_eos,
+                            void (*emit)(void*, int), void* ctx,
+                            double* prefill_ms, double* decode_ms, int* stop_hit);
+void chlorine_trunk_shutdown(void);
+}
+
+bool g_trunk_ready = false;
+
+struct EmitCtx {
+  long id;
+  int fd;
+};
+
+static void trunk_emit(void* ctx, int tok) {
+  EmitCtx* e = (EmitCtx*)ctx;
+  char buf[48];
+  int n = snprintf(buf, sizeof buf, "T %ld %d\n", e->id, tok);
+  size_t off = 0;
+  while (off < (size_t)n) {
+    ssize_t w = send(e->fd, buf + off, size_t(n) - off, MSG_NOSIGNAL);
+    if (w <= 0) return;
+    off += size_t(w);
+  }
+}
+
+void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& eos,
+                   const std::vector<int>& prompt, int drafter, bool has_sample,
+                   double temp, int top_k, double top_p, double min_p,
+                   unsigned long long seed, bool logprobs, int fd) {
+  (void)ctx; (void)drafter; (void)temp; (void)top_k; (void)top_p; (void)min_p; (void)seed;
+  (void)logprobs;
+  if (has_sample) {
+    // Sampler phase pending (docs/halogen/HOST-LOGIC.md section 4); greedy-only
+    // for now — the original samples, so reject rather than silently serve a
+    // different distribution.
+    fprintf(stderr, "serve: request %ld sampling not implemented yet (greedy-only build)\n", id);
+    char buf[64];
+    snprintf(buf, sizeof buf, "D %ld error 0 0 0.0 0.0\n", id);
+    send(fd, buf, strlen(buf), MSG_NOSIGNAL);
+    return;
+  }
+  if (!g_trunk_ready) {
+    fprintf(stderr, "serve: request %ld trunk unavailable\n", id);
+    char buf[64];
+    snprintf(buf, sizeof buf, "D %ld error 0 0 0.0 0.0\n", id);
+    send(fd, buf, strlen(buf), MSG_NOSIGNAL);
+    return;
+  }
+  EmitCtx ec{id, fd};
+  double prefill_ms = 0, decode_ms = 0;
+  int stop_hit = 0;
+  int n_gen = chlorine_trunk_generate(prompt.data(), int(prompt.size()), max_tokens,
+                                      eos.data(), int(eos.size()), trunk_emit, &ec,
+                                      &prefill_ms, &decode_ms, &stop_hit);
+  if (n_gen < 0) {
+    fprintf(stderr, "serve: request %ld prompt/max_tokens out of trunk capacity (%d)\n",
+            id, n_gen);
+    char buf[64];
+    snprintf(buf, sizeof buf, "D %ld error 0 0 0.0 0.0\n", id);
+    send(fd, buf, strlen(buf), MSG_NOSIGNAL);
+    return;
+  }
+  char buf[160];
+  snprintf(buf, sizeof buf, "D %ld %s %zu %d %.1f %.1f 0 0 0\n", id,
+           stop_hit ? "stop" : "length", prompt.size(), n_gen, prefill_ms, decode_ms);
+  size_t off = 0;
+  size_t len = strlen(buf);
+  while (off < len) {
+    ssize_t w = send(fd, buf + off, len - off, MSG_NOSIGNAL);
+    if (w <= 0) return;
+    off += size_t(w);
+  }
+}
 
 void stub_generate(void* ctx, long id, int max_tokens, const std::vector<int>& eos,
                    const std::vector<int>& prompt, int drafter, bool has_sample,
@@ -96,8 +176,16 @@ int main(int argc, char** argv) {
     o.port = port;
     o.bind = bind;
     o.default_drafter = ckpt.has_dflash2() ? 2 : (ckpt.has_mtp() ? 1 : 0);
-    Server svr(ckpt, o, stub_generate, nullptr);
+    // CHLORINE_STUB=1 forces the deterministic stub generator (wire-protocol
+    // conformance runs; the real trunk takes minutes per GEN while weights
+    // stream from the checkpoint).
+    if (!getenv("CHLORINE_STUB") && !g_trunk_ready && !ckpt_path.empty())
+      g_trunk_ready = chlorine_trunk_init(ckpt_path.c_str()) == 0;
+    Server svr(ckpt, o, g_trunk_ready && !getenv("CHLORINE_STUB") ? real_generate
+                                                                  : stub_generate,
+               nullptr);
     svr.serve();
   }
+  if (g_trunk_ready) chlorine_trunk_shutdown();
   return 0;
 }
