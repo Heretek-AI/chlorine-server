@@ -166,17 +166,20 @@ the normalized Hadamard-256 gives corr(W_rec, W) = 0.9920-0.9924 across
 rows. Engine correctness follows: acts are rotated by the same H (the
 k_actq butterfly IS the fast Hadamard transform), so W'·a' = W·a exactly.
 
-**File layout (i4l, interleaved per row)**:
-- row n = [K/2 bytes of 4-bit two's-complement codes (lo nib = even k')]
-  ++ [2·(K/256) bytes of scales]: down_proj = 8704 + 136 B (row stride
-  8840); gate/up_proj = 2560 + 40 B (row stride 2600). Tensor size
-  N·(K/2 + 2K/256) exactly (45,260,800 for [5120,17408]).
-- scales = one fp16 per (n, 256-k' chunk): value = 8-bit mantissa ×
-  tensor-shared fixed exponent 2^-8 (bytes = [b, 0x1D] little-endian,
-  fp16(b | 0x1D00) = (1 + (256+b)/1024)·2^-8); scale = absmax(rotated
-  chunk)/7 EXACTLY (absmax/s = 7.000 at p1/p50/p99).
+**File layout (i4l, universal — verified on down_proj AND gate_proj)**:
+- [N rows × K/2 bytes of 4-bit two's-complement codes (lo nib = even k')]
+  ++ [separate scale block at the end: N × (K/256) fp16 LE]. Tensor size
+  = N·K/2 + N·(K/256)·2 exactly (45,260,800 for BOTH [5120,17408] =
+  5120·8704 + 5120·136 and [17408,5120] = 17408·2560 + 17408·40).
+  (An earlier note claimed per-row interleaved scales — wrong; the block
+  is contiguous after all payload rows.)
+- scales = one fp16 per (n, 256-k' chunk): 8-bit mantissa × tensor-shared
+  fixed exponent (2^-8 for layer 0 down/gate; bytes = [b, 0x1D] LE, fp16
+  value = (1 + (256+b)/1024)·2^-8); scale = absmax(rotated chunk)/7
+  EXACTLY (absmax/s = 7.000 at p1/p50/p99 on both tensors).
 - dequant: W'[n,k'] = code[n,k'] · s[n][k'>>8]
 - reconstruction: W[n, 256c:(c+1)·256] = W'[n, same] @ Hadamard256/16
+- gate_proj verification: corr 0.9922-0.9931 (rows 0-3), absmax/s = 7.000.
 
 **Shadow tensors**: every i4l tensor has a same-dims q4c (dt=5) twin
 (e.g. layers.0.mlp.down_proj.weight dt=5 + .weight.i4l dt=8). q4c =
