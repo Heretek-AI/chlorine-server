@@ -53,7 +53,7 @@ __device__ inline float bf16f(uint16_t h) { uint32_t u = (uint32_t)h << 16; retu
 __device__ inline uint16_t f32bf(float f) {
   uint32_t u = __float_as_uint(f);
   uint32_t lo = u & 0xFFFFu;
-  u = (u >> 16) + ((lo > 0x7FFFu) | ((lo == 0x7FFFu) & ((u >> 16) & 1u)));
+  u = (u >> 16) + (lo > 0x8000u) + ((lo == 0x8000u) & ((u >> 16) & 1u));
   return (uint16_t)(u & 0xFFFFu);
 }
 static inline float h_bf16f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
@@ -117,12 +117,13 @@ __global__ void k_gemm(const uint16_t* __restrict__ A, const uint16_t* __restric
         sa[ty][c] = (m < M && k < K) ? A[(long)m * K + k] : (uint16_t)0;
       }
       __syncthreads();
-      for (int kk = 0; kk < 64; kk++) {
-        float av = bf16f(sa[ty][kk]);
-        acc[mt][0] += av * bf16f(sw[tx][kk]);
-        acc[mt][1] += av * bf16f(sw[tx + 16][kk]);
-        acc[mt][2] += av * bf16f(sw[tx + 32][kk]);
-        acc[mt][3] += av * bf16f(sw[tx + 48][kk]);
+      // BLASLt MI16x16x1 emulation: wmma accumulates k as ascending pair-sums
+      for (int kk = 0; kk < 64; kk += 2) {
+        float a0 = bf16f(sa[ty][kk]), a1 = bf16f(sa[ty][kk + 1]);
+        acc[mt][0] += (a0 * bf16f(sw[tx][kk]) + a1 * bf16f(sw[tx][kk + 1]));
+        acc[mt][1] += (a0 * bf16f(sw[tx + 16][kk]) + a1 * bf16f(sw[tx + 16][kk + 1]));
+        acc[mt][2] += (a0 * bf16f(sw[tx + 32][kk]) + a1 * bf16f(sw[tx + 32][kk + 1]));
+        acc[mt][3] += (a0 * bf16f(sw[tx + 48][kk]) + a1 * bf16f(sw[tx + 48][kk + 1]));
       }
       __syncthreads();
     }
@@ -388,6 +389,22 @@ __global__ void k_gdn_gatednorm(const uint16_t* __restrict__ CO, const uint16_t*
     float sg = z / (1.0f + expf(-z));        // silu(z) in f32
     O[(long)t * (HV * DV) + h * DV + d] = f32bf(bf16f(mb) * sg);
   }
+}
+
+// exact device gate computation (matches engine k_dn_gates semantics)
+__global__ void k_gdn_gates(const uint16_t* __restrict__ ABa, const uint16_t* __restrict__ ABb,
+                            const float* __restrict__ al, const float* __restrict__ dt,
+                            float* __restrict__ Gout, float* __restrict__ Bout, long n) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  int h = (int)(i % HV);
+  float a = bf16f(ABa[i]) + dt[h];
+  float sp = a > 20.0f ? a : log1pf(expf(a));
+  float G = -expf(al[h]) * sp;
+  float b = bf16f(ABb[i]);
+  float beta = 1.0f / (1.0f + expf(-b));
+  Gout[i] = G;
+  Bout[i] = beta;
 }
 
 // ---------------- MLP act ----------------
@@ -875,6 +892,62 @@ __global__ void k_gemv_dq(const uint16_t* __restrict__ A,
   if (tid == 0) C[n] = f32bf(sh[0]);
 }
 
+// tiled fp8r GEMM matching BLASLt accumulation (single per-element k-chain)
+template<int PAIR>
+__global__ void k_gemm_fp8r(const uint16_t* __restrict__ A, const uint8_t* __restrict__ Wc,
+                            const uint16_t* __restrict__ Ws, uint16_t* __restrict__ C,
+                            int M, int N, int K) {
+  __shared__ uint16_t sw[64][64];
+  __shared__ uint16_t sa[16][64];
+  int n0 = blockIdx.x * 64;
+  int tx = threadIdx.x, ty = threadIdx.y;
+  float wscale = (n0 + (blockIdx.y ? 0 : 0)) >= 0 ? bf16f(Ws[n0 + tx + 0]) : 0.f; // placeholder
+  (void)wscale;
+  float acc[4];
+  for (int e = 0; e < 4; e++) acc[e] = 0.f;
+  int m = blockIdx.y * 16 + ty;
+  for (int k0 = 0; k0 < K; k0 += 64) {
+    for (int s = 0; s < 16; s++) {
+      int l = (ty * 16 + tx) + s * 256;
+      int r = l & 63, c = l >> 6;
+      long n = (long)n0 + r, k = (long)k0 + c;
+      if (n < N && k < K) {
+        float w = dequant_fp8_e4m3(Wc[(size_t)n * K + k]) * bf16f(Ws[n]);
+        sw[r][c] = f32bf(w);
+      } else sw[r][c] = 0;
+    }
+    __syncthreads();
+    for (int s = 0; s < 4; s++) {
+      int c = tx + s * 16;
+      long k = (long)k0 + c;
+      sa[ty][c] = (m < M && k < K) ? A[(long)m * K + k] : (uint16_t)0;
+    }
+    __syncthreads();
+    if (PAIR) {
+      for (int kk = 0; kk < 64; kk += 2) {
+        float a0 = bf16f(sa[ty][kk]), a1 = bf16f(sa[ty][kk + 1]);
+        acc[0] += (a0 * bf16f(sw[tx][kk]) + a1 * bf16f(sw[tx][kk + 1]));
+        acc[1] += (a0 * bf16f(sw[tx + 16][kk]) + a1 * bf16f(sw[tx + 16][kk + 1]));
+        acc[2] += (a0 * bf16f(sw[tx + 32][kk]) + a1 * bf16f(sw[tx + 32][kk + 1]));
+        acc[3] += (a0 * bf16f(sw[tx + 48][kk]) + a1 * bf16f(sw[tx + 48][kk + 1]));
+      }
+    } else {
+      for (int kk = 0; kk < 64; kk++) {
+        float av = bf16f(sa[ty][kk]);
+        acc[0] += av * bf16f(sw[tx][kk]);
+        acc[1] += av * bf16f(sw[tx + 16][kk]);
+        acc[2] += av * bf16f(sw[tx + 32][kk]);
+        acc[3] += av * bf16f(sw[tx + 48][kk]);
+      }
+    }
+    __syncthreads();
+  }
+  for (int e = 0; e < 4; e++) {
+    long n = (long)n0 + tx + e * 16;
+    if (n < N) C[(long)m * N + n] = f32bf(acc[e]);
+  }
+}
+
 // plain bf16 GEMV with f32 output (lm_head at T == 1)
 __global__ void k_gemv_bf16f(const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
                              float* __restrict__ C, int K) {
@@ -919,6 +992,10 @@ static bool gemv_dq(const uint16_t* A, const char* name, uint16_t* C) {  if (!d_
 static uint16_t *d_embed, *d_lmhead;
 static uint16_t *d_ln_in_all, *d_ln_post_all, *d_final_norm;
 static uint16_t *d_gdn_conv, *d_gdn_a, *d_gdn_b, *d_gdn_norm;
+static float *d_alog, *d_dtbias, *d_gateG, *d_gateB;
+static int g_gemm_mode = 0;
+static int g_deq_trunc = 0;   // 0 = gemv_dq (split-k), 1 = tiled fp8r plain, 2 = tiled fp8r pairs
+static float *h_gateG_dev, *h_gateB_dev;   // host mirrors of device gates
 static uint16_t *d_qnorm, *d_knorm;
 static uint16_t *d_qkv, *d_z, *d_outp;
 static uint16_t *d_q, *d_k, *d_v, *d_o;
@@ -944,6 +1021,8 @@ static uint16_t* h_abbf;      // [TMAX][48]
 static float* h_af;           // [TMAX][48]
 static float* h_bf;           // [TMAX][48]
 static uint16_t* h_co;        // [TMAX][6144]
+static float* h_gateG;        // [TMAX][48] device-computed exact gates
+static float* h_gateB;
 static int* h_prompt; static int h_nprompt;
 static float h_qscale;
 
@@ -1005,6 +1084,7 @@ static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float*
   const float* al = h_alog + (long)ord * HV;
   const float* dt = h_dtbias + (long)ord * HV;
   const int CS = 64;
+  (void)al; (void)dt; (void)af; (void)bfv;
   const int nch = (T + CS - 1) / CS;
   const int NP = nch * CS;
 #ifdef _OPENMP
@@ -1031,9 +1111,8 @@ static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float*
         Q[(long)t * DK + i] = qv; K[(long)t * DK + i] = kv_;
       }
       for (int i = 0; i < DV; i++) V[(long)t * DV + i] = h_bf16f(vp[i]);
-      G[t] = -expf(al[hh]) * softplusf(af[(long)t * HV + hh] + dt[hh]);
-      B[t] = 1.0f / (1.0f + expf(-bfv[(long)t * HV + hh]));   // k_dn_gates emits f32 beta
-      if (!g_beta32) B[t] = h_bf16f(h_f32bf(B[t]));
+      G[t] = h_gateG_dev[(long)t * HV + hh];
+      B[t] = h_gateB_dev[(long)t * HV + hh];
     }
     std::vector<float> vb((long)NP * DV), kb((long)NP * DK);
     for (int t = 0; t < NP; t++) {
@@ -1146,6 +1225,13 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     } else {
       if (!fused) {
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); getw(nm, QKVW, HID, d_qkv);
+        { const char* dp = getenv("HALO_DUMP_WQ");
+          if (dp && l == 0) { CK(hipDeviceSynchronize()); void* hb = malloc((long)QKVW * HID * 2);
+            CK(hipMemcpy(hb, d_qkv, (long)QKVW * HID * 2, hipMemcpyDeviceToHost));
+            FILE* f = fopen(dp, "wb"); fwrite(hb, 1, (long)QKVW * HID * 2, f); fclose(f); free(hb); }
+          if (getenv("HALO_DEQ_DBG") && l == 0) {
+            uint16_t v; CK(hipMemcpy(&v, d_qkv + 5L * HID + 16, 2, hipMemcpyDeviceToHost));
+            printf("[ours qkv(5,16)] = %u (%f)\n", (unsigned)v, h_bf16f(v)); } }
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   getw(nm, HV * DV, HID, d_z);
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l);    getw(nm, HID, HV * DV, d_outp);
       }
@@ -1175,13 +1261,38 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     double tc = now_s();
     if (!fa) {
       // ---- GDN branch ----
-      if (fused) {
+      { const char* qp = getenv("HALO_GEMM_MODE"); if (qp) g_gemm_mode = atoi(qp); }
+      { const char* qp = getenv("HALO_DEQ_TRUNC"); if (qp) g_deq_trunc = atoi(qp); }
+      { const char* qp = getenv("HALO_QKV_IN");
+        if (qp && l == 0 && T > 1) {
+          FILE* fp = fopen(qp, "rb");
+          if (fp) { void* hb = malloc((long)T * QKVW * 2);
+            size_t rn = fread(hb, 1, (long)T * QKVW * 2, fp); fclose(fp);
+            CK(hipMemcpy(d_qkvraw, hb, rn, hipMemcpyHostToDevice)); free(hb);
+            fprintf(stderr, "[qkv-in] replaced d_qkvraw with %zu bytes\n", rn); }
+        } else if (fused) {
+        if (g_gemm_mode) {
+          const WEnt* wq = &g_wmap.at((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l), nm));
+          const WEnt* wz = &g_wmap.at((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l), nm));
+          int Nq = (int)wq->rows, Nz = (int)wz->rows;
+          const uint16_t* wqs = (const uint16_t*)(d_wpool + wq->off + (size_t)wq->rows * wq->cols);
+          const uint16_t* wzs = (const uint16_t*)(d_wpool + wz->off + (size_t)wz->rows * wz->cols);
+          dim3 gq((unsigned)((Nq + 63) / 64), (unsigned)T), gz((unsigned)((Nz + 63) / 64), (unsigned)T);
+          if (g_gemm_mode == 1) {
+            k_gemm_fp8r<0><<<gq, dim3(16, 16)>>>(d_ln1, d_wpool + wq->off, wqs, d_qkvraw, T, Nq, (int)wq->cols);
+            k_gemm_fp8r<0><<<gz, dim3(16, 16)>>>(d_ln1, d_wpool + wz->off, wzs, d_zout, T, Nz, (int)wz->cols);
+          } else {
+            k_gemm_fp8r<1><<<gq, dim3(16, 16)>>>(d_ln1, d_wpool + wq->off, wqs, d_qkvraw, T, Nq, (int)wq->cols);
+            k_gemm_fp8r<1><<<gz, dim3(16, 16)>>>(d_ln1, d_wpool + wz->off, wzs, d_zout, T, Nz, (int)wz->cols);
+          }
+        } else {
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); gemv_dq(d_ln1, nm, d_qkvraw);
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   gemv_dq(d_ln1, nm, d_zout);
+        }
       } else {
         gemm(d_ln1, d_qkv, d_qkvraw, T, QKVW, HID);
         gemm(d_ln1, d_z, d_zout, T, HV * DV, HID);
-      }
+      } }
       if (T > 1) {
         k_conv1d<<<GRID1((long)T * QKVW), 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc, T);
         k_conv_setstate<<<QKVW / 256, 256>>>(d_qkvraw, d_convstate + (long)gi * QKVW * 3, T);
@@ -1192,12 +1303,33 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
       gemm(d_ln1, d_gdn_a + (long)gi * HV * HID, d_ab_a, T, HV, HID);
       gemm(d_ln1, d_gdn_b + (long)gi * HV * HID, d_ab_b, T, HV, HID);
       CK(hipDeviceSynchronize());
+      { const char* dp = getenv("HALO_DUMP_QKVRAW");
+        if (dp && l == 0) { void* hb = malloc((long)T * QKVW * 2);
+          CK(hipDeviceSynchronize()); CK(hipMemcpy(hb, d_qkvraw, (long)T * QKVW * 2, hipMemcpyDeviceToHost));
+          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, (long)T * QKVW * 2, f); fclose(f); free(hb); } }
+      { const char* dp = getenv("HALO_DUMP_QKVC");
+        if (dp && l == 0) { void* hb = malloc(4096);
+          CK(hipDeviceSynchronize()); CK(hipMemcpy(hb, d_qkvc, 4096, hipMemcpyDeviceToHost));
+          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 4096, f); fclose(f); free(hb); } }
       CK(hipMemcpy(h_qkvbf, d_qkvc, (long)T * QKVW * 2, hipMemcpyDeviceToHost));
       CK(hipMemcpy(h_abbf, d_ab_a, (long)T * HV * 2, hipMemcpyDeviceToHost));
       for (long i = 0; i < (long)T * HV; i++) h_af[i] = h_bf16f(h_abbf[i]);
       CK(hipMemcpy(h_abbf, d_ab_b, (long)T * HV * 2, hipMemcpyDeviceToHost));
       for (long i = 0; i < (long)T * HV; i++) h_bf[i] = h_bf16f(h_abbf[i]);
       double ts = now_s();
+      k_gdn_gates<<<GRID1((long)T * HV), 256>>>(d_ab_a, d_ab_b, d_alog + (long)gi * HV,
+                                                d_dtbias + (long)gi * HV, d_gateG, d_gateB, (long)T * HV);
+      CK(hipDeviceSynchronize());
+      CK(hipMemcpy(h_gateG_dev, d_gateG, (long)T * HV * 4, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(h_gateB_dev, d_gateB, (long)T * HV * 4, hipMemcpyDeviceToHost));
+      { const char* dp = getenv("HALO_DUMP_GB");
+        if (dp && l == 0) { void* hb = malloc(4096 * 2);
+          CK(hipMemcpy(hb, d_gateG, 4096, hipMemcpyDeviceToHost));
+          CK(hipMemcpy((char*)hb + 4096, d_gateB, 4096, hipMemcpyDeviceToHost));
+          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 8192, f); fclose(f); free(hb); } }
+      { const char* dp = getenv("HALO_DUMP_AB");
+        if (dp && l == 0) { FILE* f = fopen(dp, "wb");
+          fwrite(h_af, 4, 1024, f); fwrite(h_bf, 4, 1024, f); fclose(f); } }
       gdn_scan(T, h_qkvbf, h_af, h_bf, gi, h_co);
       double tscan = now_s() - ts;
       if (g_dbg) {
@@ -1220,7 +1352,15 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
                1.f / (1.f + expf(-h_bf[0])));
       }
       up(d_co, h_co, (long)T * HV * DV * 2);
+      { const char* dp = getenv("HALO_DUMP_CO");
+        if (dp && l == 0) { void* hb = malloc(2048);
+          CK(hipMemcpy(hb, d_co, 2048, hipMemcpyDeviceToHost));
+          FILE* f = fopen(dp, "wb"); fwrite(hb, 1, 2048, f); fclose(f); free(hb); } }
       k_gdn_gatednorm<<<GRID1((long)T * HV), 256>>>(d_co, d_zout, d_gdn_norm + (long)gi * DV, d_gn, T);
+      { const char* gp = getenv("HALO_DUMP_GN");
+        if (gp && l == 0) { CK(hipDeviceSynchronize()); void* hb2 = malloc(2048);
+          CK(hipMemcpy(hb2, d_gn, 2048, hipMemcpyDeviceToHost));
+          FILE* f = fopen(gp, "wb"); fwrite(hb2, 1, 2048, f); fclose(f); free(hb2); } }
       if (fused) {
         snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l); gemv_dq(d_gn, nm, d_tmp1);
       } else {
@@ -1385,6 +1525,12 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
   CK(hipMalloc((void**)&d_gdn_norm, (long)48 * DV * 2));
   h_alog = (float*)malloc((long)48 * HV * 4);
   h_dtbias = (float*)malloc((long)48 * HV * 4);
+  h_gateG_dev = (float*)malloc((long)TMAX * HV * 4);
+  h_gateB_dev = (float*)malloc((long)TMAX * HV * 4);
+  CK(hipMalloc((void**)&d_alog, (long)48 * HV * 4));
+  CK(hipMalloc((void**)&d_dtbias, (long)48 * HV * 4));
+  CK(hipMalloc((void**)&d_gateG, (long)TMAX * HV * 4));
+  CK(hipMalloc((void**)&d_gateB, (long)TMAX * HV * 4));
   { int gi = 0;
     for (int l = 0; l < NL; l++) {
       if (l % 4 == 3) continue;
@@ -1404,6 +1550,8 @@ extern "C" int chlorine_trunk_init(const char* ckpt_path) {
       rd(e->off, h_stage2, 96);
       { uint16_t* u = (uint16_t*)h_stage2;
         for (int i = 0; i < HV; i++) h_dtbias[(long)gi * HV + i] = h_bf16f(u[i]); }
+      CK(hipMemcpy(d_alog + (long)gi * HV, h_alog + (long)gi * HV, HV * 4, hipMemcpyHostToDevice));
+      CK(hipMemcpy(d_dtbias + (long)gi * HV, h_dtbias + (long)gi * HV, HV * 4, hipMemcpyHostToDevice));
       gi++;
     } }
   CK(hipMalloc((void**)&d_qnorm, (long)16 * HD * 2));
