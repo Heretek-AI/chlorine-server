@@ -40,7 +40,7 @@ static const float THETA = 1e7f;
 static const float EPS   = 1e-6f;
 static const int   CXT   = 176;      // kv cache capacity (>= 174 u16-seq prefill, 87+24 decode)
 static const int   TMAX  = 176;      // activation rows
-static const char* CKPT  = "/home/ronin/Projects/models/halogen-qwen3.8-27b/qwen3.8-27b-p1w4d-d2.hgn";
+static const char* CKPT  = "/home/ronin/Projects/chlorine-server/models/qwen3.8-27b-p1w4d-d2.hgn";
 
 static int ROPE_MODE = 0;   // 0: HF half-split pairs (p, p+32); 1: interleaved (2p, 2p+1)
 
@@ -888,7 +888,7 @@ int main(int argc, char** argv) {
   h_qscale = 1.0f / sqrtf((float)DK);
 
   // ---- prompt ----
-  { FILE* pf = fopen("/tmp/prompt_ids.json", "rb");
+  { FILE* pf = fopen("/home/ronin/Projects/chlorine-server/work/opencode/prompt_ids.json", "rb");
     if (!pf) { printf("no prompt file\n"); return 1; }
     static char buf[8192]; size_t n = fread(buf, 1, sizeof(buf) - 1, pf); buf[n] = 0; fclose(pf);
     h_prompt = (int*)malloc(TMAX * 4); h_nprompt = 0;
@@ -927,7 +927,7 @@ int main(int argc, char** argv) {
   // 16-byte header {magic, 0, rows, 1}; rows of 16 B: {u32 pred, u32 tgt, f32 nll, i32 doc}
   int refrows = 0;
   static long refpred[256]; static long reftgt[256]; static float refnll[256];
-  { FILE* fd = fopen("/tmp/forced-text.bin", "rb");
+  { FILE* fd = fopen("/home/ronin/Projects/chlorine-server/work/opencode/forced-text.bin", "rb");
     if (!fd) { printf("no forced dump\n"); return 1; }
     uint8_t hdr[16]; if (fread(hdr, 1, 16, fd) != 16) { printf("dump hdr\n"); return 1; }
     refrows = hdr[8] | (hdr[9] << 8) | (hdr[10] << 16) | (hdr[11] << 24);

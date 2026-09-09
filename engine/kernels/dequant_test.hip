@@ -66,7 +66,7 @@ static uint16_t to_bf16(float f) {
 }
 
 int main() {
-  const char* ckpt = "/home/ronin/Projects/models/halogen-qwen3.8-27b/qwen3.8-27b-p1w4d-d2.hgn";
+  const char* ckpt = "/home/ronin/Projects/chlorine-server/models/qwen3.8-27b-p1w4d-d2.hgn";
   FILE* f = fopen(ckpt, "rb");
   if (!f) { printf("no ckpt\n"); return 1; }
   // read tensor table
