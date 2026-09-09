@@ -112,9 +112,71 @@ boundary crossings in the engine's GEMM/attention kernels vs ours.
    hoisted row scale) but not the exact tree.
 3. **k_actq exact scheme** (group size, scale formula, rounding) for the bench
    path.
-4. Sampler (argmax only today), prompt-cache, spec decoding, KV capacity
-   (trunk context cap is CXT=448 until the cache grows), per-step perf
-   (q4c GEMV ~1 s/step — vectorize dequant, LDS LUT).
+4. Prompt-cache, spec decoding, KV capacity (trunk context cap is CXT=448
+   until the cache grows), per-step perf (q4c GEMV ~1 s/step — vectorize
+   dequant, LDS LUT).
+5. **Sampler exactness (beyond distribution)**: the k_sample draw-scan
+   convention (u×mass target, vocab-order single-thread scan) is our reading
+   of the ISA; the top-k selection and the `(int)` conversions around the
+   target in `k_sample` (obj1.so @0x19100, two bodies = top-k / no-top-k) are
+   not fully decoded. Seeded wire parity vs the original on 8730 is the
+   empirical gate.
+
+## 8. W4A4 dispatch map (decoded from the host decomp, 2026-09 session)
+
+The `HALOGEN_W4A4` env value is **a row-count threshold**, not a bitflag:
+- model+0x410 (u32) = threshold; default **64** (decomp site ~3209), env
+  override when > 0 (site ~5347; unset/≤0 → 0x801).
+- Forward path per GEMM shape: rows ≥ threshold → `k_actq` (grid =
+  (rows+127)~127) + `k_gemm_i4` (WMMA int4, cached per-tensor act buffer via
+  the name-keyed allocator FUN_00567090); rows < threshold → **8-row-batched
+  path** (FUN_00567330 loops ≤8 rows → FUN_005b67f0 → `k_gemv` with its own
+  act handling).
+- Therefore: `HALOGEN_W4A4=1` → everything W4A4 (bench = 5.918531); `=1024+`
+  → the 87-row prefill takes the gemv route ("clean" = 5.559855); default 64
+  → the forced/bench prefill (87 rows) is W4A4 while decode (1 row) is gemv —
+  matching every observed number.
+- k_actq launcher FUN_005bfb10 (param_5 = template 0/1, PTR 005c2ab0/2ab8);
+  gemv launcher = switch on K-tile 1..8 (param_4), grid ceil(N/16) for the
+  param3=2 variants (PTR 005c2858+); k_gemv template params confirmed:
+  param1 = weight format {0=q4c-qparam0, 1=q4c-qparam1, 2=fp8r}, PKh arg =
+  packed-int4 activations (all GEMMs take quantized activations — there is no
+  bf16 GEMM in the engine).
+- Serve prefill appears to run the gemv (sub-threshold) route, which is why
+  our clean prefill matches the serve stream and not the bench dump.
+
+## 9. Sampler (implemented 2026-09 session)
+
+- **k_sample semantics** (host re-implementation in generator.hip:
+  `chlorine_sample_host`, wired through `chlorine_trunk_generate2`):
+  penalties (presence/frequency from per-request token counts) and BIAS
+  scatter into a **bf16** copy of the logits row (the engine's k_pen_scatter
+  targets a bf16 scratch; we round f32→bf16 RNE before and after each add),
+  then temp softmax (f32), top-k, top-p (inclusive crossing), min-p
+  (p ≥ min_p·p_max), renormalize, draw.
+- **Counter RNG decoded from k_sample ISA** (obj1.so @1A0D4): 
+  `c = (posctr)*0xd1b54a32d192ed03 ^ seed ^ (aux*0x9e3779b97f4a7c15)`,
+  `c += 0x9e3779b97f4a7c15`, splitmix64 finalizer (bf58…/94d0…), 
+  `u = (c >> 40) * 2^-24` (top 24 bits). posctr = n_prompt + generated-so-far
+  (engine: base + loop index; first token = n_prompt). aux = opts[6] = 0 in
+  every observed call site.
+- **--sample-check semantics reversed**: it runs the FORCED-bench forward
+  (even-token seq + zero pad = 87 tokens) and samples at the LAST row (85);
+  the expected table = top-K of the full-vocab softmax **renormalized over
+  the support** (HFD3 row 85 ids = the printed table's ids; printed
+  p = dump_lp_exp / Σtop32). Our harness mode `trunk3 samplecheck` reproduces
+  this (chi2/df = 1.055 LOOKS RIGHT, off-support 0; table delta vs the
+  original = the Phase-A W4A4 residual, our top-8: 0/.273 198/.141 91/.109
+  15/.073 16/.072 271/.057 220/.027 12/.026 vs ref 198/.255269 271/.255269
+  0/.068705 729/.064542 279/.044359 2834/.041672 561/.028640 369/.023744).
+- **Wire integration**: SAMPLE/PENALTY/BIAS/LOGPROBS parsed in serve.cpp
+  (values kept now), sampler-only fields rejected when temp ≤ 0 (D error);
+  LOGPROBS appends ` %.9g` logprob to T lines. Verified live: greedy stream
+  unchanged (271 51 1618…), seeded SAMPLE reproduces the decoded RNG (seed
+  12345 → u=0.1133 → 198), BIAS −5 on 198/271 shifts the draw to 91170.
+- **Engine tie-break note**: the forced-bench row 85 has 198 and 271 at an
+  EXACT bf16 logit tie; the engine's argmax picks 198 (lower id) — k_argmax
+  tie order = first max in scan order.
 
 ## 7. Engine integration notes
 

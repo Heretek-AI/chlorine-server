@@ -15,6 +15,7 @@
 #include <cstring>
 #include <vector>
 #include <map>
+#include <algorithm>
 #include <sys/time.h>
 
 #define CK(x) do { hipError_t e = (x); if (e) { printf("HIP err %s @%d\n", hipGetErrorString(e), __LINE__); exit(1);} } while (0)
@@ -1275,6 +1276,198 @@ extern "C" int chlorine_trunk_generate(const int* prompt, int n_prompt, long max
     k_argmax1<<<1, 256>>>(d_logits, d_pred, VOC);
     CK(hipDeviceSynchronize());
     CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
+  }
+  *decode_ms = (now_s() - td) * 1000.0;
+  *stop_hit = stop;
+  return n_gen;
+}
+
+// ---------------- sampler (HOST-LOGIC.md section 5) ----------------
+// k_sample semantics: penalties -> bf16 logits -> temp softmax -> top-k ->
+// top-p -> min-p -> renormalize -> draw. Counter RNG decoded from the k_sample
+// ISA (obj1.so): c = posctr*0xd1b54a32d192ed03 ^ seed ^ (aux*0x9e3779b97f4a7c15);
+// c += 0x9e3779b97f4a7c15; splitmix64 finalizer; u = (c >> 40) * 2^-24.
+typedef struct {
+  int has_sample;
+  float temp;
+  int top_k;
+  float top_p, min_p;
+  unsigned long long seed;
+  float presence, frequency;
+  int n_bias;
+  const int* bias_ids;
+  const float* bias_vals;
+  int logprobs;
+} chlorine_sample_opts;
+
+static float* g_pinrow = nullptr;   // pinned VOC f32 staging for sampler copies
+
+static inline unsigned long long sm_fin(unsigned long long x) {
+  x ^= x >> 30; x *= 0xbf58476d1ce4e5b9ULL;
+  x ^= x >> 27; x *= 0x94d049bb133111ebULL;
+  return x;
+}
+
+static float sample_uniform(unsigned long long seed, unsigned int posctr, unsigned int aux) {
+  unsigned long long c = (unsigned long long)posctr * 0xd1b54a32d192ed03ULL;
+  c ^= (unsigned long long)aux * 0x9e3779b97f4a7c15ULL;
+  c ^= seed;
+  c += 0x9e3779b97f4a7c15ULL;
+  c = sm_fin(c);
+  return (float)(unsigned)(c >> 40) * (1.0f / 16777216.0f);
+}
+
+// One sampling step. d_row: device f32 logits [VOC]; counts: per-request
+// generated-token counts (host, VOC); posctr: n_prompt + generated-so-far.
+extern "C" int chlorine_sample_host(const float* d_row, int* counts, unsigned int posctr,
+                                    const chlorine_sample_opts* o,
+                                    int* out_tok, float* out_logp) {
+  if (!g_pinrow) CK(hipHostMalloc((void**)&g_pinrow, (size_t)VOC * 4));
+  CK(hipMemcpy(g_pinrow, d_row, (size_t)VOC * 4, hipMemcpyDeviceToHost));
+  float* L = g_pinrow;
+  // engine logits are bf16 (k_nll/k_argmax read u16); penalties scatter into a
+  // bf16 copy, so round first and re-round after every f32 delta add
+  for (int v = 0; v < VOC; v++) L[v] = h_bf16f(h_f32bf(L[v]));
+  if (o->presence != 0.f || o->frequency != 0.f) {
+    for (int t = 0; t < VOC; t++) {
+      if (counts[t] > 0) {
+        float d = -(o->presence + o->frequency * (float)counts[t]);
+        L[t] = h_bf16f(h_f32bf(L[t] + d));
+      }
+    }
+  }
+  for (int i = 0; i < o->n_bias; i++) {
+    int t = o->bias_ids[i];
+    if (t >= 0 && t < VOC) L[t] = h_bf16f(h_f32bf(L[t] + o->bias_vals[i]));
+  }
+  // temp softmax (f32 throughout, like k_sample)
+  float mx = L[0];
+  for (int v = 1; v < VOC; v++) if (L[v] > mx) mx = L[v];
+  float inv_t = 1.0f / o->temp;
+  static std::vector<float> p;
+  static std::vector<unsigned char> keep;
+  static std::vector<int> idx;
+  p.resize(VOC); keep.resize(VOC); idx.resize(VOC);
+  double tot = 0.0;
+  for (int v = 0; v < VOC; v++) { float e = expf((L[v] - mx) * inv_t); p[v] = e; tot += e; }
+  float ftot = (float)tot;
+  int nkeep = 0;
+  for (int v = 0; v < VOC; v++) idx[v] = v;
+  if (o->top_k > 0 && o->top_k < VOC) {
+    // top-k: k largest probs (ties -> lower id), via nth_element
+    int k = o->top_k;
+    std::nth_element(idx.data(), idx.data() + k, idx.data() + VOC,
+                     [&](int a, int b) {
+                       if (p[a] != p[b]) return p[a] > p[b];
+                       return a < b;
+                     });
+    for (int i = 0; i < k; i++) keep[idx[i]] = 1;
+    nkeep = k;
+  } else {
+    for (int v = 0; v < VOC; v++) keep[v] = 1;
+    nkeep = VOC;
+  }
+  if (o->top_p > 0.f && o->top_p < 1.f) {
+    // nucleus within the kept set: sort desc, keep until cum >= top_p (inclusive)
+    std::vector<int> nk;
+    nk.reserve(nkeep);
+    for (int v = 0; v < VOC; v++) if (keep[v]) nk.push_back(v);
+    std::sort(nk.begin(), nk.end(), [&](int a, int b) {
+      if (p[a] != p[b]) return p[a] > p[b];
+      return a < b;
+    });
+    float cum = 0.f;
+    int cut = (int)nk.size();
+    for (int i = 0; i < (int)nk.size(); i++) {
+      cum += p[nk[i]];
+      if (cum >= o->top_p * ftot) { cut = i + 1; break; }
+    }
+    for (int i = 0; i < cut; i++) keep[nk[i]] = 1;
+    for (int i = cut; i < (int)nk.size(); i++) keep[nk[i]] = 0;
+  }
+  if (o->min_p > 0.f) {
+    // min-p: normalized prob >= min_p * p_max (p_max = 1/tot after temp scaling)
+    float thr = o->min_p / ftot;
+    for (int v = 0; v < VOC; v++)
+      if (keep[v] && p[v] < thr) keep[v] = 0;
+  }
+  double tkept = 0.0;
+  for (int v = 0; v < VOC; v++) if (keep[v]) tkept += p[v];
+  if (tkept <= 0.0) {  // degenerate: fall back to argmax
+    int am = 0;
+    for (int v = 1; v < VOC; v++) if (L[v] > L[am]) am = v;
+    *out_tok = am;
+    *out_logp = 0.f;
+    return 0;
+  }
+  float u = sample_uniform(o->seed, posctr, 0);
+  float target = u * (float)tkept;
+  float cum = 0.f;
+  int tok = -1;
+  for (int v = 0; v < VOC; v++) {
+    if (!keep[v]) continue;
+    cum += p[v];
+    if (cum >= target) { tok = v; break; }
+  }
+  if (tok < 0) {  // rounding edge: last kept token
+    for (int v = VOC - 1; v >= 0; v--)
+      if (keep[v]) { tok = v; break; }
+  }
+  *out_tok = tok;
+  *out_logp = logf(p[tok] / (float)tkept);
+  return 0;
+}
+
+// Sampling generate: same trunk loop as chlorine_trunk_generate with the host
+// sampler (temp/top-k/top-p/min-p/seed, presence/frequency penalties, bias,
+// logprobs). posctr for the counter RNG = n_prompt + generated-so-far (the
+// engine passes base + loop index; first token = n_prompt).
+extern "C" int chlorine_trunk_generate2(const int* prompt, int n_prompt, long max_tokens,
+                                        const int* eos, int n_eos,
+                                        void (*emit)(void*, int, float), void* ctx,
+                                        double* prefill_ms, double* decode_ms, int* stop_hit,
+                                        const chlorine_sample_opts* opts) {
+  if (!g_ready) return -1;
+  if (n_prompt < 1 || n_prompt > CXT - 2 || max_tokens < 1 ||
+      max_tokens > (long)(CXT - n_prompt)) return -2;
+  bool sample = opts && opts->has_sample;
+  static std::vector<int> counts;
+  counts.assign(VOC, 0);
+  trunk_reset_states();
+  double tp = now_s();
+  up(d_tok, prompt, (size_t)n_prompt * 4);
+  forward(d_tok, n_prompt, 0, 1);
+  *prefill_ms = (now_s() - tp) * 1000.0;
+
+  double td = now_s();
+  int n_gen = 0, tok = 0, stop = 0;
+  float logp = 0.f;
+  if (sample) {
+    chlorine_sample_host(d_logits + (long)(n_prompt - 1) * VOC, counts.data(),
+                         (unsigned)n_prompt, opts, &tok, &logp);
+    counts[tok]++;
+  } else {
+    k_argmax1<<<1, 256>>>(d_logits + (long)(n_prompt - 1) * VOC, d_pred, VOC);
+    CK(hipDeviceSynchronize());
+    CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
+  }
+  while (!stop && n_gen < max_tokens) {
+    emit(ctx, tok, sample ? logp : 0.f);
+    n_gen++;
+    for (int i = 0; i < n_eos; i++)
+      if (eos[i] == tok) { stop = 1; break; }
+    if (stop || n_gen >= max_tokens) break;
+    up(d_tok, &tok, 4);
+    forward(d_tok, 1, n_prompt - 1 + n_gen, 1);
+    if (sample) {
+      chlorine_sample_host(d_logits, counts.data(), (unsigned)(n_prompt + n_gen),
+                           opts, &tok, &logp);
+      counts[tok]++;
+    } else {
+      k_argmax1<<<1, 256>>>(d_logits, d_pred, VOC);
+      CK(hipDeviceSynchronize());
+      CK(hipMemcpy(&tok, d_pred, 4, hipMemcpyDeviceToHost));
+    }
   }
   *decode_ms = (now_s() - td) * 1000.0;
   *stop_hit = stop;

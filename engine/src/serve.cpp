@@ -84,45 +84,49 @@ void Server::handle_gen(int fd, std::istringstream& in) {
     if (!(in >> prompt[i])) return fail("malformed GEN");
 
   int drafter = -1;
-  bool has_sample = false, logprobs = false;
-  double temp = 0, top_p = 0, min_p = 0;
-  int top_k = 0;
-  unsigned long long seed = 0;
+  GenOpts o;
+  o.has_sample = false;
   std::string tok;
   while (in >> tok) {
     if (tok == "SAMPLE") {
-      if (!(in >> temp >> top_k >> top_p >> min_p >> seed)) return fail("malformed GEN");
-      has_sample = true;
+      if (!(in >> o.temp >> o.top_k >> o.top_p >> o.min_p >> o.seed))
+        return fail("malformed GEN");
+      o.has_sample = true;
     } else if (tok == "PENALTY") {
-      double pp, fp;
-      if (!(in >> pp >> fp)) return fail("malformed GEN");
-      if (!has_sample) return fail("sent PENALTY/BIAS/LOGPROBS without temperature>0");
+      if (!(in >> o.presence >> o.frequency)) return fail("malformed GEN");
+      if (!o.has_sample) return fail("sent PENALTY/BIAS/LOGPROBS without temperature>0");
     } else if (tok == "BIAS") {
       int n;
       if (!(in >> n)) return fail("malformed GEN");
       if (n < 0 || n > 20480) return fail("malformed GEN");
+      o.bias_ids.resize(size_t(n));
+      o.bias_vals.resize(size_t(n));
       for (int i = 0; i < n; i++) {
-        int tid;
+        long long tid;
         double v;
         if (!(in >> tid >> v)) return fail("malformed GEN");
+        if (tid < 0 || tid >= 248320) return fail("malformed GEN");
+        o.bias_ids[size_t(i)] = int(tid);
+        o.bias_vals[size_t(i)] = float(v);
       }
-      if (!has_sample) return fail("sent PENALTY/BIAS/LOGPROBS without temperature>0");
+      if (!o.has_sample) return fail("sent PENALTY/BIAS/LOGPROBS without temperature>0");
     } else if (tok == "LOGPROBS") {
-      if (!has_sample) return fail("sent PENALTY/BIAS/LOGPROBS without temperature>0");
-      logprobs = true;
+      o.logprobs = true;
+      if (!o.has_sample) return fail("sent PENALTY/BIAS/LOGPROBS without temperature>0");
     } else {
       drafter = atoi(tok.c_str());
       if (drafter < 0 || drafter > 2) return fail("asked for unknown drafter");
     }
   }
+  if (o.has_sample && o.temp <= 0) return fail("SAMPLE requires temperature > 0");
   if (max_tokens < 0) return fail("malformed GEN");
   if (drafter > 2) return fail("asked for unknown drafter");
   long clamp = 0x3fff7 - n_prompt + (max_tokens == 0 ? 9 : 0);
   if (max_tokens > clamp) max_tokens = clamp;
   if (drafter > 0 && drafter == 1 && !ckpt_.has_mtp()) return fail("cannot serve the mtp drafter");
   if (drafter > 0 && drafter == 2 && !ckpt_.has_dflash2()) return fail("cannot serve the dflash2 drafter");
-  gen_(gen_ctx_, id, int(max_tokens), eos, prompt, drafter, has_sample, temp,
-       top_k, top_p, min_p, seed, logprobs, fd);
+  o.drafter = drafter;
+  gen_(gen_ctx_, id, int(max_tokens), eos, prompt, o, fd);
 }
 
 void Server::handle_line(int fd, const std::string& line) {

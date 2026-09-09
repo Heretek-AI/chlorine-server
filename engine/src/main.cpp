@@ -21,10 +21,23 @@ namespace {
 // HIP trunk backend (engine/src/generator.hip), compiled with hipcc when present.
 extern "C" {
 int chlorine_trunk_init(const char* ckpt_path);
-int chlorine_trunk_generate(const int* prompt, int n_prompt, long max_tokens,
-                            const int* eos, int n_eos,
-                            void (*emit)(void*, int), void* ctx,
-                            double* prefill_ms, double* decode_ms, int* stop_hit);
+typedef struct {
+  int has_sample;
+  float temp;
+  int top_k;
+  float top_p, min_p;
+  unsigned long long seed;
+  float presence, frequency;
+  int n_bias;
+  const int* bias_ids;
+  const float* bias_vals;
+  int logprobs;
+} chlorine_sample_opts;
+int chlorine_trunk_generate2(const int* prompt, int n_prompt, long max_tokens,
+                             const int* eos, int n_eos,
+                             void (*emit)(void*, int, float), void* ctx,
+                             double* prefill_ms, double* decode_ms, int* stop_hit,
+                             const chlorine_sample_opts* opts);
 void chlorine_trunk_shutdown(void);
 }
 
@@ -33,12 +46,14 @@ bool g_trunk_ready = false;
 struct EmitCtx {
   long id;
   int fd;
+  bool logprobs;
 };
 
-static void trunk_emit(void* ctx, int tok) {
+static void trunk_emit(void* ctx, int tok, float logp) {
   EmitCtx* e = (EmitCtx*)ctx;
-  char buf[48];
-  int n = snprintf(buf, sizeof buf, "T %ld %d\n", e->id, tok);
+  char buf[64];
+  int n = e->logprobs ? snprintf(buf, sizeof buf, "T %ld %d %.9g\n", e->id, tok, double(logp))
+                      : snprintf(buf, sizeof buf, "T %ld %d\n", e->id, tok);
   size_t off = 0;
   while (off < (size_t)n) {
     ssize_t w = send(e->fd, buf + off, size_t(n) - off, MSG_NOSIGNAL);
@@ -48,21 +63,8 @@ static void trunk_emit(void* ctx, int tok) {
 }
 
 void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& eos,
-                   const std::vector<int>& prompt, int drafter, bool has_sample,
-                   double temp, int top_k, double top_p, double min_p,
-                   unsigned long long seed, bool logprobs, int fd) {
-  (void)ctx; (void)drafter; (void)temp; (void)top_k; (void)top_p; (void)min_p; (void)seed;
-  (void)logprobs;
-  if (has_sample) {
-    // Sampler phase pending (docs/halogen/HOST-LOGIC.md section 4); greedy-only
-    // for now — the original samples, so reject rather than silently serve a
-    // different distribution.
-    fprintf(stderr, "serve: request %ld sampling not implemented yet (greedy-only build)\n", id);
-    char buf[64];
-    snprintf(buf, sizeof buf, "D %ld error 0 0 0.0 0.0\n", id);
-    send(fd, buf, strlen(buf), MSG_NOSIGNAL);
-    return;
-  }
+                   const std::vector<int>& prompt, const chlorine::GenOpts& go, int fd) {
+  (void)ctx;
   if (!g_trunk_ready) {
     fprintf(stderr, "serve: request %ld trunk unavailable\n", id);
     char buf[64];
@@ -70,12 +72,25 @@ void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& e
     send(fd, buf, strlen(buf), MSG_NOSIGNAL);
     return;
   }
-  EmitCtx ec{id, fd};
+  chlorine_sample_opts so = {};
+  so.has_sample = go.has_sample ? 1 : 0;
+  so.temp = float(go.temp);
+  so.top_k = go.top_k;
+  so.top_p = float(go.top_p);
+  so.min_p = float(go.min_p);
+  so.seed = go.seed;
+  so.presence = float(go.presence);
+  so.frequency = float(go.frequency);
+  so.n_bias = int(go.bias_ids.size());
+  so.bias_ids = go.bias_ids.data();
+  so.bias_vals = go.bias_vals.data();
+  so.logprobs = go.logprobs ? 1 : 0;
+  EmitCtx ec{id, fd, go.logprobs};
   double prefill_ms = 0, decode_ms = 0;
   int stop_hit = 0;
-  int n_gen = chlorine_trunk_generate(prompt.data(), int(prompt.size()), max_tokens,
-                                      eos.data(), int(eos.size()), trunk_emit, &ec,
-                                      &prefill_ms, &decode_ms, &stop_hit);
+  int n_gen = chlorine_trunk_generate2(prompt.data(), int(prompt.size()), max_tokens,
+                                       eos.data(), int(eos.size()), trunk_emit, &ec,
+                                       &prefill_ms, &decode_ms, &stop_hit, &so);
   if (n_gen < 0) {
     fprintf(stderr, "serve: request %ld prompt/max_tokens out of trunk capacity (%d)\n",
             id, n_gen);
@@ -97,11 +112,8 @@ void real_generate(void* ctx, long id, int max_tokens, const std::vector<int>& e
 }
 
 void stub_generate(void* ctx, long id, int max_tokens, const std::vector<int>& eos,
-                   const std::vector<int>& prompt, int drafter, bool has_sample,
-                   double temp, int top_k, double top_p, double min_p,
-                   unsigned long long seed, bool logprobs, int fd) {
-  (void)ctx; (void)drafter; (void)has_sample; (void)temp; (void)top_k;
-  (void)top_p; (void)min_p; (void)seed;
+                   const std::vector<int>& prompt, const chlorine::GenOpts& o, int fd) {
+  (void)ctx; (void)o;
   // Deterministic stub: token ids derived from the prompt. Never emits an eos
   // unless the prompt itself ends with one (then 0 tokens).
   std::string out;
