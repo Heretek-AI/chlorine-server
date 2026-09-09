@@ -50,22 +50,30 @@ Layout: `[64-byte codebook][row 0: payload+scales][row 1: payload+scales]…`
   bytes at ±256 offsets (two 16-element groups per thread-iteration) and
   u16 scale pairs.
 
-## i4l — row structure known, element order OPEN
+## i4l — 2026-09-09 deep probe results (element order still OPEN)
 
-- Sizes resolve **exactly** as interleaved rows: `[rows × (cols/2 payload +
-  extra)]` (qkv `10240 × (2560+40)` = 26,624,000 ✓; down `5120 × (8704+136)`
-  = 45,260,800 ✓) — same row-interleaved family as q4c.
-- Per-row extra = cols/128 bytes ⇒ **one scale per 128 columns** (40 or 136
-  scales/row). Scale byte encoding presumed e4m3 like q4c `[TO CONFIRM]`.
-- Element values: signed int4 two's complement (same code-8-never-occurs
-  signature).
-- **Element order is NOT row-major**: raw int4 of the i4l twin does NOT
-  correlate with the q4c twin's row 0 (corr ≈ 0.001) — the "L" is a GEMM-
-  tiled layout consumed by `k_gemm_i4` (prefill W4A4 path) and
-  `k_gemv<2,*>`. Cracking it requires the address arithmetic in
-  `k_gemm_i4<0>` (`/tmp/opencode/gemm0.asm`, ~2000 lines) `[OPEN]`.
-- qparam `0x10100` on every i4l tensor: likely `(flags<<16)|0x100`; exact
-  field semantics `[OPEN]`.
+- Sizes resolve as `[rows × (cols/2 payload + cols/128 extra)]`; the extra
+  block decodes as **all-positive finite fp16** (u16 LE, 68/row for
+  `[5120,17408]`) — but the values do NOT match base chunk-absmaxes under
+  identity or simple permutations (identity med ratio 0.98, ±45% spread;
+  the 98.8% "near-exact set match" is a density artifact).
+- **k_actq fully decoded** (obj7.so): per (row, 256-col chunk-pair);
+  64 lanes × 4 bf16 loads; group absmax xor-butterfly in f32; u8 codes to a
+  per-tensor cached buffer, u16 scales to a shared per-call buffer; padding
+  rows zero-filled. Row pointer = base + (nchunkpairs·row + pair)·128 — the
+  same chunk-pair structure as the gemm staging.
+- **k_gemm_i4 staging**: two 32-row×128 B copies per iteration (acts +
+  weights), global row stride = K/2 (natural 16-B records), LDS rows 0x90 B
+  (128+16 pad), WMMA iu4 16x16x16, epilogue cvt_f32_i32 + fma_mix with the
+  packed act scales (u16→bf16) — integer accumulation, scales at the end.
+- **Element order falsified for row 0** vs base W: natural row-major
+  (sign 0.502, rankcorr −0.002), W^T reading (0.41), 32×256 tiles at head +
+  every 128-B offset in 512 KB (LS rel-residual ≥ 0.9956), sign-magnitude
+  reading (0.497), FFT xcorr over the full 89M-nibble stream (no dominant
+  peak). The mapping is a GEMM-fragment tiling not derivable from the local
+  staging window; needs the LDS-consumption (WMMA fragment read) side of
+  gemm0.asm, or a differential probe. Probes: /tmp/opencode/i4l_*.py.
+- qparam `0x10100` on every i4l tensor: exact field semantics `[OPEN]`.
 
 ## Validation summary
 
