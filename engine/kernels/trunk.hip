@@ -1,0 +1,1045 @@
+// trunk.hip — chlorine-server numeric core validation (spec: docs/halogen/*.md)
+// Qwen3.8-27B hybrid trunk (48 GDN + 16 FA layers) on gfx1151.
+// Math source: HF transformers Qwen3.5 modeling (Apache-2.0) — GatedDeltaNet,
+// Qwen3_5Attention, Qwen3_5RMSNorm(ZeroCentered), Qwen3_5RMSNormGated.
+// Weight formats: docs/halogen/KERNELS-DEQUANT.md (validated formulas reused).
+//
+// Modes:  tf   — teacher-forced forward over /tmp/prompt_ids.json (87 tokens),
+//                compare vs /tmp/forced-text.bin (HFD2 dump from the original engine)
+//         dec  — prefill + 24 greedy tokens, compare vs the original's stream
+#include <hip/hip_runtime.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cmath>
+#include <cstdint>
+#include <cstring>
+#include <vector>
+#include <sys/time.h>
+
+#define CK(x) do { hipError_t e = (x); if (e) { printf("HIP err %s @%d\n", hipGetErrorString(e), __LINE__); exit(1);} } while (0)
+#define GRID1(n) (unsigned)((((long)(n)) + 255) / 256)
+
+// ---------------- model constants ----------------
+static const int   HID   = 5120;      // hidden
+static const int   VOC   = 248320;    // vocab
+static const int   NL    = 64;        // layers; layer%4==3 -> full_attention
+static const int   INTM  = 17408;     // mlp intermediate
+// GDN (linear_attn)
+static const int   HK    = 16;        // k heads
+static const int   HV    = 48;        // v heads
+static const int   DK    = 128;       // k head dim
+static const int   DV    = 128;       // v head dim
+static const int   QKVW  = 10240;     // qkv width (q 2048 | k 2048 | v 6144)
+// FA (self_attn)
+static const int   QH    = 24;        // q heads
+static const int   KVH   = 4;         // kv heads
+static const int   HD    = 256;       // head dim
+static const int   NPAIR = 32;        // rotary pairs (partial 0.25 -> 64 dims)
+static const float SCALE = 0.0625f;   // 1/sqrt(256)
+static const float THETA = 1e7f;
+static const float EPS   = 1e-6f;
+static const int   CXT   = 176;      // kv cache capacity (>= 174 u16-seq prefill, 87+24 decode)
+static const int   TMAX  = 176;      // activation rows
+static const char* CKPT  = "/home/ronin/Projects/models/halogen-qwen3.8-27b/qwen3.8-27b-p1w4d-d2.hgn";
+
+static int ROPE_MODE = 0;   // 0: HF half-split pairs (p, p+32); 1: interleaved (2p, 2p+1)
+
+static double now_s() { struct timeval tv; gettimeofday(&tv, nullptr); return tv.tv_sec + tv.tv_usec * 1e-6; }
+
+// ---------------- bf16 helpers ----------------
+__device__ inline float bf16f(uint16_t h) { uint32_t u = (uint32_t)h << 16; return __uint_as_float(u); }
+__device__ inline uint16_t f32bf(float f) {
+  uint32_t u = __float_as_uint(f);
+  uint32_t lo = u & 0xFFFFu;
+  u = (u >> 16) + ((lo > 0x7FFFu) | ((lo == 0x7FFFu) & ((u >> 16) & 1u)));
+  return (uint16_t)(u & 0xFFFFu);
+}
+static inline float h_bf16f(uint16_t h) { uint32_t u = (uint32_t)h << 16; float f; memcpy(&f, &u, 4); return f; }
+static inline uint16_t h_f32bf(float f) {
+  uint32_t u; memcpy(&u, &f, 4);
+  uint32_t lo = u & 0xFFFFu;
+  u = (u >> 16) + ((lo > 0x7FFFu) | ((lo == 0x7FFFu) & ((u >> 16) & 1u)));
+  return (uint16_t)(u & 0xFFFFu);
+}
+
+// ---------------- dequant (from dequant_test.hip, validated) ----------------
+__device__ inline float dequant_fp8_e4m3(uint32_t b) {
+  float s = (b & 0x80u) ? -1.0f : 1.0f;
+  uint32_t e = (b >> 3) & 0xFu, m = b & 0x7u;
+  if (e == 0) return s * (float)m * 0.125f * ldexpf(1.0f, -6);
+  return s * (1.0f + (float)m * 0.125f) * ldexpf(1.0f, (int)e - 7);
+}
+__global__ void k_dequant_fp8r(const uint8_t* __restrict__ payload, const uint16_t* __restrict__ scales,
+                               uint16_t* __restrict__ out, long cols) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  long r = i / cols;
+  float w = dequant_fp8_e4m3(payload[i]) * bf16f(scales[r]);
+  out[i] = f32bf(w);
+}
+__global__ void k_dequant_q4c(const float* __restrict__ cb, const uint8_t* __restrict__ rowbase,
+                              uint16_t* __restrict__ out, long cols) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  long r = i / cols, c = i % cols;
+  const uint8_t* pay = rowbase + (long)r * (cols / 2 + cols / 16);
+  uint8_t byte = pay[c / 2];
+  uint32_t nib = (c & 1) ? ((byte >> 4) & 0xFu) : (byte & 0xFu);
+  float w = cb[nib] * dequant_fp8_e4m3(pay[cols / 2 + c / 16]);
+  out[i] = f32bf(w);
+}
+
+// ---------------- GEMM: C[M,N] = A[M,K] x W[N,K]^T, bf16 in, f32 accum ----------------
+// block 16x16; grid.x = ceil(N/64); block loops all 16-row m-tiles (M <= 96).
+template<int F32OUT>
+__global__ void k_gemm(const uint16_t* __restrict__ A, const uint16_t* __restrict__ W,
+                       uint16_t* __restrict__ C, float* __restrict__ Cf,
+                       int M, int N, int K) {
+  int n0 = blockIdx.x * 64;
+  int tx = threadIdx.x, ty = threadIdx.y;
+  __shared__ uint16_t sw[64][64];
+  __shared__ uint16_t sa[16][64];
+  float acc[6][4];
+  for (int i = 0; i < 6; i++) for (int j = 0; j < 4; j++) acc[i][j] = 0.f;
+  for (int k0 = 0; k0 < K; k0 += 64) {
+    for (int s = 0; s < 16; s++) {
+      int l = (ty * 16 + tx) + s * 256;
+      int r = l >> 6, c = l & 63;
+      long n = (long)n0 + r; long k = (long)k0 + c;
+      sw[r][c] = (n < N && k < K) ? W[n * K + k] : (uint16_t)0;
+    }
+    __syncthreads();
+    for (int mt = 0; mt < 6; mt++) {
+      int m0 = mt * 16;
+      for (int s = 0; s < 4; s++) {
+        int c = tx + s * 16;
+        long k = (long)k0 + c; int m = m0 + ty;
+        sa[ty][c] = (m < M && k < K) ? A[(long)m * K + k] : (uint16_t)0;
+      }
+      __syncthreads();
+      for (int kk = 0; kk < 64; kk++) {
+        float av = bf16f(sa[ty][kk]);
+        acc[mt][0] += av * bf16f(sw[tx][kk]);
+        acc[mt][1] += av * bf16f(sw[tx + 16][kk]);
+        acc[mt][2] += av * bf16f(sw[tx + 32][kk]);
+        acc[mt][3] += av * bf16f(sw[tx + 48][kk]);
+      }
+      __syncthreads();
+    }
+  }
+  for (int mt = 0; mt < 6; mt++) {
+    int m = mt * 16 + ty;
+    if (m >= M) continue;
+    for (int e = 0; e < 4; e++) {
+      long n = (long)n0 + tx + e * 16;
+      if (n >= N) continue;
+      if (F32OUT) Cf[(long)m * N + n] = acc[mt][e];
+      else C[(long)m * N + n] = f32bf(acc[mt][e]);
+    }
+  }
+}
+static void gemm(const uint16_t* A, const uint16_t* W, uint16_t* C, int M, int N, int K) {
+  dim3 b(16, 16);
+  for (int m0 = 0; m0 < M; m0 += 96) {          // kernel supports M <= 96; chunk by m
+    int mm = M - m0 < 96 ? M - m0 : 96;
+    dim3 g((N + 63) / 64);
+    hipLaunchKernelGGL((k_gemm<0>), g, b, 0, 0, A + (long)m0 * K, W, C + (long)m0 * N, (float*)nullptr, mm, N, K);
+  }
+}
+static void gemm_f32(const uint16_t* A, const uint16_t* W, float* Cf, int M, int N, int K) {
+  dim3 b(16, 16);
+  for (int m0 = 0; m0 < M; m0 += 96) {
+    int mm = M - m0 < 96 ? M - m0 : 96;
+    dim3 g((N + 63) / 64);
+    hipLaunchKernelGGL((k_gemm<1>), g, b, 0, 0, A + (long)m0 * K, W, (uint16_t*)nullptr, Cf + (long)m0 * N, mm, N, K);
+  }
+}
+
+// ---------------- norms ----------------
+__global__ void k_rmsnorm(const uint16_t* __restrict__ X, const uint16_t* __restrict__ w,
+                          uint16_t* __restrict__ O, int K, int T, int zero_center) {
+  int row = blockIdx.x; if (row >= T) return;
+  __shared__ float sh[256];
+  int tid = threadIdx.x;
+  float s = 0.f;
+  for (int c = tid; c < K; c += 256) { float v = bf16f(X[(long)row * K + c]); s += v * v; }
+  sh[tid] = s; __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) { if (tid < off) sh[tid] += sh[tid + off]; __syncthreads(); }
+  float inv = rsqrtf(sh[0] / (float)K + EPS);
+  for (int c = tid; c < K; c += 256) {
+    float v = bf16f(X[(long)row * K + c]);
+    float wv = zero_center ? (1.0f + bf16f(w[c])) : bf16f(w[c]);
+    O[(long)row * K + c] = f32bf(v * inv * wv);
+  }
+}
+// per-head RMSNorm (zero-centered (1+w)): src row stride sstride, D elems/head; dst [T,heads,D]
+__global__ void k_headnorm(const uint16_t* __restrict__ X, const uint16_t* __restrict__ w,
+                           uint16_t* __restrict__ O, int T, int heads, int sstride, int D) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= (long)T * heads) return;
+  int t = (int)(i / heads), h = (int)(i % heads);
+  const uint16_t* xp = X + (long)t * sstride + (long)h * D;
+  float ss = 0.f;
+  for (int d = 0; d < D; d++) { float v = bf16f(xp[d]); ss += v * v; }
+  float inv = rsqrtf(ss / (float)D + EPS);
+  uint16_t* op = O + ((long)t * heads + h) * D;
+  for (int d = 0; d < D; d++) {
+    float nrm = bf16f(xp[d]) * inv;
+    op[d] = f32bf(nrm * (1.0f + bf16f(w[d])));
+  }
+}
+
+// ---------------- embed gather / residual ----------------
+__global__ void k_embed(const int* __restrict__ ids, const uint16_t* __restrict__ E,
+                        uint16_t* __restrict__ X, int H) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  long t = i / H;
+  X[i] = E[(long)ids[t] * H + (i % H)];
+}
+__global__ void k_add(const uint16_t* __restrict__ A, const uint16_t* __restrict__ B,
+                      uint16_t* __restrict__ O, long n) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  O[i] = f32bf(bf16f(A[i]) + bf16f(B[i]));
+}
+
+// ---------------- conv1d (causal, kernel 4, groups, silu) ----------------
+__global__ void k_conv1d(const uint16_t* __restrict__ X, const uint16_t* __restrict__ Wc,
+                         uint16_t* __restrict__ O, long T) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= T * QKVW) return;
+  int t = (int)(i / QKVW), c = (int)(i % QKVW);
+  float acc = 0.f;
+  for (int j = 0; j < 4; j++) {
+    int tt = t + j - 3;
+    if (tt >= 0) acc += bf16f(Wc[c * 4 + j]) * bf16f(X[(long)tt * QKVW + c]);
+  }
+  uint16_t yb = f32bf(acc);
+  float yf = bf16f(yb);
+  O[i] = f32bf(yf / (1.0f + expf(-yf)));
+}
+__global__ void k_conv1d_step(const uint16_t* __restrict__ X, const uint16_t* __restrict__ Wc,
+                              uint16_t* __restrict__ O, uint16_t* __restrict__ st) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= QKVW) return;
+  float acc = bf16f(st[c * 3 + 0]) * bf16f(Wc[c * 4 + 0])
+            + bf16f(st[c * 3 + 1]) * bf16f(Wc[c * 4 + 1])
+            + bf16f(st[c * 3 + 2]) * bf16f(Wc[c * 4 + 2])
+            + bf16f(X[c])          * bf16f(Wc[c * 4 + 3]);
+  uint16_t yb = f32bf(acc);
+  float yf = bf16f(yb);
+  O[c] = f32bf(yf / (1.0f + expf(-yf)));
+  st[c * 3 + 0] = st[c * 3 + 1];
+  st[c * 3 + 1] = st[c * 3 + 2];
+  st[c * 3 + 2] = X[c];
+}
+__global__ void k_conv_setstate(const uint16_t* __restrict__ X, uint16_t* __restrict__ st, long T) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  if (c >= QKVW) return;
+  for (int j = 0; j < 3; j++) st[c * 3 + j] = X[(long)(T - 3 + j) * QKVW + c];
+}
+
+// ---------------- RoPE (partial: 64 dims of 256, theta 1e7) ----------------
+__global__ void k_rope(uint16_t* __restrict__ X, long T, int heads, int pos_base, int mode) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  long total = (long)T * heads * NPAIR;
+  if (i >= total) return;
+  int p = (int)(i % NPAIR);
+  int h = (int)((i / NPAIR) % heads);
+  int t = (int)(i / ((long)NPAIR * heads));
+  uint16_t* xp = X + ((long)t * heads + h) * HD;
+  int pos = pos_base + t;
+  float inv = powf(THETA, -(float)(2 * p) / 64.0f);
+  float ang = (float)pos * inv;
+  float c = cosf(ang), s = sinf(ang);
+  uint16_t cb = f32bf(c), sb = f32bf(s);   // HF casts cos/sin to bf16 before applying
+  float cf = bf16f(cb), sf = bf16f(sb);
+  int d1, d2;
+  if (mode) { d1 = 2 * p; d2 = 2 * p + 1; } else { d1 = p; d2 = p + NPAIR; }
+  float a1 = bf16f(xp[d1]), a2 = bf16f(xp[d2]);
+  xp[d1] = f32bf(a1 * cf - a2 * sf);
+  xp[d2] = f32bf(a2 * cf + a1 * sf);
+}
+
+// ---------------- KV cache write ----------------
+__global__ void k_kvwrite(const uint16_t* __restrict__ S, uint16_t* __restrict__ KC,
+                          long T, int pos_base) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= (long)T * KVH * HD) return;
+  int d = (int)(i % HD), h = (int)((i / HD) % KVH), t = (int)(i / ((long)KVH * HD));
+  KC[((long)(pos_base + t) * KVH + h) * HD + d] = S[i];
+}
+
+// ---------------- FA attention ----------------
+__global__ void k_attn_scores(const uint16_t* __restrict__ Q, const uint16_t* __restrict__ KC,
+                              float* __restrict__ S, int T, int Tmax) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= (long)QH * T * T) return;
+  int j = (int)(i % T), t = (int)((i / T) % T), h = (int)(i / ((long)T * T));
+  if (j > t) return;
+  int kvh = h / (QH / KVH);
+  const uint16_t* qp = Q + ((long)t * QH + h) * HD;
+  const uint16_t* kp = KC + ((long)j * KVH + kvh) * HD;
+  float s = 0.f;
+  for (int d = 0; d < HD; d++) s += bf16f(qp[d]) * bf16f(kp[d]);
+  S[(long)h * Tmax * Tmax + (long)t * Tmax + j] = s * SCALE;
+}
+__global__ void k_attn_softmax(const float* __restrict__ S, uint16_t* __restrict__ Pbf, int T, int Tmax) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= (long)QH * T) return;
+  int t = (int)(i % T), h = (int)(i / T);
+  const float* row = S + (long)h * Tmax * Tmax + (long)t * Tmax;
+  uint16_t* pb = Pbf + (long)h * Tmax * Tmax + (long)t * Tmax;
+  float mx = -3.0e38f;
+  for (int j = 0; j <= t; j++) mx = fmaxf(mx, row[j]);
+  float sum = 0.f;
+  for (int j = 0; j <= t; j++) sum += expf(row[j] - mx);
+  float inv = 1.0f / sum;
+  for (int j = 0; j <= t; j++) pb[j] = f32bf(expf(row[j] - mx) * inv);
+}
+__global__ void k_attn_pv(const uint16_t* __restrict__ Pbf, const uint16_t* __restrict__ VC,
+                          uint16_t* __restrict__ O, int T, int Tmax) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= (long)T * QH * HD) return;
+  int d = (int)(i % HD), h = (int)((i / HD) % QH), t = (int)(i / ((long)QH * HD));
+  int kvh = h / (QH / KVH);
+  const uint16_t* pb = Pbf + (long)h * Tmax * Tmax + (long)t * Tmax;
+  float acc = 0.f;
+  for (int j = 0; j <= t; j++) acc += bf16f(pb[j]) * bf16f(VC[((long)j * KVH + kvh) * HD + d]);
+  O[((long)t * QH + h) * HD + d] = f32bf(acc);
+}
+__global__ void k_attn_step(const uint16_t* __restrict__ Qrow, const uint16_t* __restrict__ KC,
+                            const uint16_t* __restrict__ VC, uint16_t* __restrict__ Orow, int pos) {
+  int h = blockIdx.x; if (h >= QH) return;
+  __shared__ float sp[CXT + 1];
+  __shared__ uint16_t sb[CXT + 1];
+  int tid = threadIdx.x;
+  int kvh = h / (QH / KVH);
+  if (tid <= pos) {
+    const uint16_t* qp = Qrow + h * HD;
+    const uint16_t* kp = KC + ((long)tid * KVH + kvh) * HD;
+    float s = 0.f;
+    for (int d = 0; d < HD; d++) s += bf16f(qp[d]) * bf16f(kp[d]);
+    sp[tid] = s * SCALE;
+  }
+  __syncthreads();
+  if (tid == 0) {
+    float mx = -3.0e38f;
+    for (int j = 0; j <= pos; j++) mx = fmaxf(mx, sp[j]);
+    float sum = 0.f;
+    for (int j = 0; j <= pos; j++) { float e = expf(sp[j] - mx); sp[j] = e; sum += e; }
+    float inv = 1.0f / sum;
+    for (int j = 0; j <= pos; j++) sb[j] = f32bf(sp[j] * inv);
+  }
+  __syncthreads();
+  if (tid < HD) {
+    float acc = 0.f;
+    for (int j = 0; j <= pos; j++) acc += bf16f(sb[j]) * bf16f(VC[((long)j * KVH + kvh) * HD + tid]);
+    Orow[h * HD + tid] = f32bf(acc);
+  }
+}
+
+// ---------------- FA output gate ----------------
+__global__ void k_fa_gate(uint16_t* __restrict__ A, const uint16_t* __restrict__ QG, long T) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= (long)T * QH * HD) return;
+  int d = (int)(i % HD), h = (int)((i / HD) % QH), t = (int)(i / ((long)QH * HD));
+  float g = bf16f(QG[(long)t * (QH * HD * 2) + (long)h * HD * 2 + HD + d]);
+  float sg = 1.0f / (1.0f + expf(-g));
+  A[i] = f32bf(bf16f(A[i]) * bf16f(f32bf(sg)));
+}
+
+// ---------------- GDN output gated RMSNorm ----------------
+__global__ void k_gdn_gatednorm(const uint16_t* __restrict__ CO, const uint16_t* __restrict__ Z,
+                                const uint16_t* __restrict__ w, uint16_t* __restrict__ O, long T) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= (long)T * HV) return;
+  int t = (int)(i / HV), h = (int)(i % HV);
+  const uint16_t* hp = CO + (long)t * (HV * DV) + h * DV;
+  const uint16_t* zp = Z + (long)t * (HV * DV) + h * DV;
+  float ss = 0.f;
+  for (int d = 0; d < DV; d++) { float v = bf16f(hp[d]); ss += v * v; }
+  float inv = rsqrtf(ss / (float)DV + EPS);
+  for (int d = 0; d < DV; d++) {
+    float hn = bf16f(hp[d]) * inv;
+    uint16_t hb = f32bf(hn);                 // f32 norm -> bf16 RNE, then weight (HF order)
+    float m = bf16f(hb) * bf16f(w[d]);       // RMSNormGated: direct w (not zero-centered)
+    uint16_t mb = f32bf(m);
+    float z = bf16f(zp[d]);
+    float sg = z / (1.0f + expf(-z));        // silu(z) in f32
+    O[(long)t * (HV * DV) + h * DV + d] = f32bf(bf16f(mb) * sg);
+  }
+}
+
+// ---------------- MLP act ----------------
+__global__ void k_silu_mul(const uint16_t* __restrict__ G, const uint16_t* __restrict__ U,
+                           uint16_t* __restrict__ Hh, long n) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  if (i >= n) return;
+  float g = bf16f(G[i]);
+  float sg = g / (1.0f + expf(-g));
+  uint16_t gb = f32bf(sg);
+  Hh[i] = f32bf(bf16f(gb) * bf16f(U[i]));
+}
+
+// ---------------- logits reduction ----------------
+__global__ void k_topnll(const float* __restrict__ Lg, const int* __restrict__ rowmap,
+                         const int* __restrict__ tgt, int* __restrict__ pred, float* __restrict__ nll,
+                         int V, long T) {
+  long row = blockIdx.x; if (row >= T) return;
+  __shared__ float smx[256]; __shared__ int smi[256]; __shared__ float ss[256];
+  int tid = threadIdx.x;
+  const float* L = Lg + (long)rowmap[row] * V;
+  float mx = -3.0e38f; int mi = 0;
+  for (int v = tid; v < V; v += 256) { float x = L[v]; if (x > mx) { mx = x; mi = v; } }
+  smx[tid] = mx; smi[tid] = mi;
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (tid < off && smx[tid + off] > smx[tid]) { smx[tid] = smx[tid + off]; smi[tid] = smi[tid + off]; }
+    __syncthreads();
+  }
+  float gmx = smx[0];
+  int gmi = smi[0];
+  float s = 0.f;
+  for (int v = tid; v < V; v += 256) s += expf(L[v] - gmx);
+  ss[tid] = s; __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) { if (tid < off) ss[tid] += ss[tid + off]; __syncthreads(); }
+  if (tid == 0) {
+    pred[row] = gmi;
+    nll[row] = (gmx + logf(ss[0])) - L[tgt[row]];
+  }
+}
+__global__ void k_argmax1(const float* __restrict__ L, int* __restrict__ pred, int V) {
+  __shared__ float smx[256]; __shared__ int smi[256];
+  int tid = threadIdx.x;
+  float mx = -3.0e38f; int mi = 0;
+  for (int v = tid; v < V; v += 256) { float x = L[v]; if (x > mx) { mx = x; mi = v; } }
+  smx[tid] = mx; smi[tid] = mi;
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (tid < off && smx[tid + off] > smx[tid]) { smx[tid] = smx[tid + off]; smi[tid] = smi[tid + off]; }
+    __syncthreads();
+  }
+  if (tid == 0) pred[0] = smi[0];
+}
+
+// ================= host side =================
+struct Ent { char name[96]; long off, size; int dt; };
+static std::vector<Ent> g_tbl;
+static FILE* g_f = nullptr;
+static char nm[160];
+
+static void load_table() {
+  fseek(g_f, 0x08, SEEK_SET);
+  uint64_t n; if (fread(&n, 8, 1, g_f) != 1) { printf("hdr read fail\n"); exit(1); }
+  fseek(g_f, 0x68, SEEK_SET);
+  g_tbl.resize(n);
+  std::vector<uint8_t> raw((size_t)n * 0xA0);
+  if (fread(raw.data(), 1, raw.size(), g_f) != raw.size()) { printf("table read fail\n"); exit(1); }
+  for (uint64_t i = 0; i < n; i++) {
+    const uint8_t* e = raw.data() + i * 0xA0;
+    memcpy(g_tbl[i].name, e, 96); g_tbl[i].name[95] = 0;
+    memcpy(&g_tbl[i].off, e + 0x88, 8);
+    memcpy(&g_tbl[i].size, e + 0x90, 8);
+    uint64_t f1; memcpy(&f1, e + 0x60, 8);
+    g_tbl[i].dt = (int)(f1 & 0xFFFFFFFF);
+  }
+}
+static const Ent* find(const char* name) {
+  for (auto& e : g_tbl) if (strcmp(e.name, name) == 0) return &e;
+  printf("tensor not found: %s\n", name); exit(1);
+}
+
+static uint8_t*  h_stage;    // 64 MB pinned
+static uint8_t*  h_stage2;   // 1 MB pinned
+static uint8_t*  d_raw;      // 64 MB
+static uint16_t* d_raws;     // 512 KB
+static float*    d_cb;
+
+static void rd(long off, void* dst, size_t n) {
+  fseek(g_f, off, SEEK_SET);
+  if (fread(dst, 1, n, g_f) != n) { printf("short read @%ld\n", off); exit(1); }
+}
+static void up(void* d, const void* h, size_t n) { CK(hipMemcpy(d, h, n, hipMemcpyHostToDevice)); }
+
+// fp8r -> device bf16, row-chunked (scales at tensor tail)
+static void load_fp8r(const char* name, long rows, long cols, uint16_t* d_out) {
+  const Ent* e = find(name);
+  long chunk = (long)(32e6 / cols); if (chunk < 1) chunk = 1;
+  for (long r0 = 0; r0 < rows; r0 += chunk) {
+    long nr = chunk < rows - r0 ? chunk : rows - r0;
+    rd(e->off + r0 * cols, h_stage, (size_t)nr * cols);
+    up(d_raw, h_stage, (size_t)nr * cols);
+    rd(e->off + rows * cols + r0 * 2, h_stage2, (size_t)nr * 2);
+    up(d_raws, h_stage2, (size_t)nr * 2);
+    long n = nr * cols;
+    k_dequant_fp8r<<<GRID1(n), 256>>>(d_raw, d_raws, d_out + r0 * cols, cols);
+    CK(hipDeviceSynchronize());   // d_raw is reused next chunk
+  }
+}
+// q4c -> device bf16, row-chunked (64B codebook + per-row [payload|scales])
+static void load_q4c(const char* name, long rows, long cols, uint16_t* d_out) {
+  const Ent* e = find(name);
+  rd(e->off, h_stage, 64); up(d_cb, h_stage, 64);
+  long per = cols / 2 + cols / 16;
+  long chunk = (long)(32e6 / per); if (chunk < 1) chunk = 1;
+  for (long r0 = 0; r0 < rows; r0 += chunk) {
+    long nr = chunk < rows - r0 ? chunk : rows - r0;
+    rd(e->off + 64 + r0 * per, h_stage, (size_t)nr * per);
+    up(d_raw, h_stage, (size_t)nr * per);
+    long n = nr * cols;
+    k_dequant_q4c<<<GRID1(n), 256>>>(d_cb, d_raw, d_out + r0 * cols, cols);
+    CK(hipDeviceSynchronize());
+  }
+}
+static void load_bf16(const char* name, long bytes, void* d_out) {
+  const Ent* e = find(name);
+  long chunk = 32 << 20;
+  for (long o = 0; o < bytes; o += chunk) {
+    long nb = chunk < bytes - o ? chunk : bytes - o;
+    rd(e->off + o, h_stage, nb);
+    up((uint8_t*)d_out + o, h_stage, nb);
+  }
+}
+
+static void load_auto(const char* name, long rows, long cols, uint16_t* d_out) {
+  if (find(name)->dt == 5) load_q4c(name, rows, cols, d_out);
+  else load_fp8r(name, rows, cols, d_out);
+}
+
+// ---------------- device memory ----------------
+static uint16_t *d_embed, *d_lmhead;
+static uint16_t *d_ln_in_all, *d_ln_post_all, *d_final_norm;
+static uint16_t *d_gdn_conv, *d_gdn_a, *d_gdn_b, *d_gdn_norm;
+static uint16_t *d_qnorm, *d_knorm;
+static uint16_t *d_qkv, *d_z, *d_outp;
+static uint16_t *d_q, *d_k, *d_v, *d_o;
+static uint16_t *d_gate, *d_up, *d_down;
+static uint16_t *d_convstate;                 // [48][10240][3]
+static uint16_t *d_kcache, *d_vcache;         // [16][CXT][4][256]
+static uint16_t *d_x, *d_ln1, *d_ln2, *d_tmp1;
+static uint16_t *d_qkvraw, *d_qkvc, *d_ab_a, *d_ab_b, *d_zout, *d_co, *d_gn;
+static uint16_t *d_qg, *d_kk, *d_vv, *d_att, *d_qn, *d_kn;
+static uint16_t *d_g17, *d_u17, *d_act;
+static float *d_scores, *d_logits;
+static uint16_t *d_pbf;
+static int *d_tok, *d_tgt, *d_pred;
+static float *d_nll;
+
+// host
+static float* h_S;            // [48][48][128][128] GDN state f32 (GDN-ordinal layer index)
+static float* h_alog;         // [48][48]
+static float* h_dtbias;       // [48][48]
+static uint16_t* h_qkvbf;     // [TMAX][10240]
+static uint16_t* h_abbf;      // [TMAX][48]
+static float* h_af;           // [TMAX][48]
+static float* h_bf;           // [TMAX][48]
+static uint16_t* h_co;        // [TMAX][6144]
+static int* h_prompt; static int h_nprompt;
+static float h_qscale;
+
+static inline float softplusf(float x) { return x > 20.0f ? x : log1pf(expf(x)); }
+static inline int gdn_ord(int l) { return l - (l + 1) / 4; }   // layer idx -> GDN ordinal (0..47)
+static inline int fa_ord(int l)  { return l / 4; }             // layer idx -> FA ordinal (0..15)
+
+static int g_dbg = 0;
+static int g_steps = 0;
+static void dbg_all(const char* tag, const uint16_t* d_buf, long rows, long width) {
+  static uint16_t tmp[112 * 24832];
+  CK(hipMemcpy(tmp, d_buf, rows * width * 2, hipMemcpyDeviceToHost));
+  double mx = 0, sm = 0; long nan = 0;
+  for (long i = 0; i < rows * width; i++) {
+    float v = h_bf16f(tmp[i]);
+    if (v != v) nan++;
+    if (fabs(v) > mx) mx = fabs(v);
+    sm += v;
+  }
+  printf("  [%s] allrows mean=%.4g maxabs=%.4g nan=%ld\n", tag, sm / (rows * width), mx, nan);
+}
+static void dbg_row(const char* tag, const uint16_t* d_buf, long row, long width) {
+  static uint16_t tmp[5120];
+  CK(hipMemcpy(tmp, d_buf + row * width, width * 2, hipMemcpyDeviceToHost));
+  double mx = 0, sm = 0; int nan = 0;
+  for (long i = 0; i < width; i++) {
+    float v = h_bf16f(tmp[i]);
+    if (v != v) nan++;
+    if (fabs(v) > mx) mx = fabs(v);
+    sm += v;
+  }
+  printf("  [%s] mean=%.4g maxabs=%.4g nan=%d v0..3= %.4g %.4g %.4g %.4g\n",
+         tag, sm / width, mx, nan, h_bf16f(tmp[0]), h_bf16f(tmp[1]), h_bf16f(tmp[2]), h_bf16f(tmp[3]));
+}
+static void dbg_f32(const char* tag, const float* d_buf, long row, long width) {
+  static float tmp[248320];
+  CK(hipMemcpy(tmp, d_buf + row * width, width * 4, hipMemcpyDeviceToHost));
+  double mx = 0, sm = 0; int nan = 0;
+  for (long i = 0; i < width; i++) {
+    float v = tmp[i];
+    if (v != v) nan++;
+    if (fabs(v) > mx) mx = fabs(v);
+    sm += v;
+  }
+  printf("  [%s] mean=%.4g maxabs=%.4g nan=%d v0..3= %.4g %.4g %.4g %.4g\n",
+         tag, sm / width, mx, nan, tmp[0], tmp[1], tmp[2], tmp[3]);
+}
+
+// GDN sequential delta-rule scan (f32, host). S[ord][h][k][v] persists across calls.
+static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float* bfv,
+                     int ord, uint16_t* out) {
+  const float* al = h_alog + (long)ord * HV;
+  const float* dt = h_dtbias + (long)ord * HV;
+#ifdef _OPENMP
+  #pragma omp parallel for schedule(static)
+#endif
+  for (int hh = 0; hh < HV; hh++) {
+    float* S = h_S + ((long)ord * HV + hh) * DK * DV;
+    float q[DK], k[DK], v[DV], delta[DV], kv[DV];
+    for (int t = 0; t < T; t++) {
+      const uint16_t* qp = qkvbf + (long)t * QKVW + (hh / 3) * DK;
+      const uint16_t* kp = qkvbf + (long)t * QKVW + HK * DK + (hh / 3) * DK;
+      const uint16_t* vp = qkvbf + (long)t * QKVW + HK * DK * 2 + hh * DV;
+      float qs = 0.f, ks = 0.f;
+      for (int i = 0; i < DK; i++) {
+        float a = h_bf16f(qp[i]); q[i] = a; qs += a * a;
+        float b = h_bf16f(kp[i]); k[i] = b; ks += b * b;
+      }
+      float qi = rsqrtf(qs + EPS) * h_qscale, ki = rsqrtf(ks + EPS);
+      for (int i = 0; i < DK; i++) { q[i] *= qi; k[i] *= ki; }
+      for (int i = 0; i < DV; i++) v[i] = h_bf16f(vp[i]);
+      float g = -expf(al[hh]) * softplusf(af[(long)t * HV + hh] + dt[hh]);
+      float beta = h_bf16f(h_f32bf(1.0f / (1.0f + expf(-bfv[(long)t * HV + hh]))));
+      float decay = expf(g);
+      for (int j = 0; j < DV; j++) {
+        float s = 0.f;
+        for (int i = 0; i < DK; i++) { float* Sp = S + (long)i * DV + j; *Sp *= decay; s += *Sp * k[i]; }
+        kv[j] = s;
+      }
+      for (int j = 0; j < DV; j++) delta[j] = (v[j] - kv[j]) * beta;
+      for (int i = 0; i < DK; i++) {
+        float kk_ = k[i];
+        float* Sp = S + (long)i * DV;
+        for (int j = 0; j < DV; j++) Sp[j] += kk_ * delta[j];
+      }
+      uint16_t* op = out + (long)t * (HV * DV) + hh * DV;
+      for (int j = 0; j < DV; j++) {
+        float s = 0.f;
+        for (int i = 0; i < DK; i++) s += S[(long)i * DV + j] * q[i];
+        op[j] = h_f32bf(s);
+      }
+    }
+  }
+}
+
+// ---------------- forward ----------------
+// T tokens at positions pos_base..; logits [T][VOC] f32 in d_logits when want_logits
+static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
+  k_embed<<<GRID1((long)T * HID), 256>>>(d_tokens, d_embed, d_x, HID);
+  CK(hipDeviceSynchronize());
+  if (g_dbg) { printf("after embed:\n"); dbg_row("embed", d_x, 0, HID); }
+  for (int l = 0; l < NL; l++) {
+    double tw = now_s();
+    int fa = (l % 4 == 3);
+    int gi = fa ? fa_ord(l) : gdn_ord(l);
+    // ---- load weights for this layer (streamed from checkpoint) ----
+    if (fa) {
+      snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_proj.weight", l);  load_fp8r(nm, QH * HD * 2, HID, d_q);
+      snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_proj.weight", l);  load_fp8r(nm, KVH * HD, HID, d_k);
+      snprintf(nm, sizeof(nm), "layers.%d.self_attn.v_proj.weight", l);  load_fp8r(nm, KVH * HD, HID, d_v);
+      snprintf(nm, sizeof(nm), "layers.%d.self_attn.o_proj.weight", l);  load_fp8r(nm, HID, QH * HD, d_o);
+    } else {
+      snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_qkv.weight", l); load_fp8r(nm, QKVW, HID, d_qkv);
+      snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_z.weight", l);   load_fp8r(nm, HV * DV, HID, d_z);
+      snprintf(nm, sizeof(nm), "layers.%d.linear_attn.out_proj.weight", l);    load_fp8r(nm, HID, HV * DV, d_outp);
+    }
+    snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); load_auto(nm, INTM, HID, d_gate);
+    snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   load_auto(nm, INTM, HID, d_up);
+    snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); load_auto(nm, HID, INTM, d_down);
+    CK(hipDeviceSynchronize());
+    double tload = now_s() - tw;
+
+    // ---- input layernorm ----
+    k_rmsnorm<<<T, 256>>>(d_x, d_ln_in_all + (long)l * HID, d_ln1, HID, T, 1);
+
+    double tc = now_s();
+    if (!fa) {
+      // ---- GDN branch ----
+      gemm(d_ln1, d_qkv, d_qkvraw, T, QKVW, HID);
+      if (T > 1) {
+        k_conv1d<<<GRID1((long)T * QKVW), 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc, T);
+        k_conv_setstate<<<QKVW / 256, 256>>>(d_qkvraw, d_convstate + (long)gi * QKVW * 3, T);
+      } else {
+        k_conv1d_step<<<QKVW / 256, 256>>>(d_qkvraw, d_gdn_conv + (long)gi * QKVW * 4, d_qkvc,
+                                           d_convstate + (long)gi * QKVW * 3);
+      }
+      gemm(d_ln1, d_gdn_a + (long)gi * HV * HID, d_ab_a, T, HV, HID);
+      gemm(d_ln1, d_gdn_b + (long)gi * HV * HID, d_ab_b, T, HV, HID);
+      gemm(d_ln1, d_z, d_zout, T, HV * DV, HID);
+      CK(hipDeviceSynchronize());
+      CK(hipMemcpy(h_qkvbf, d_qkvc, (long)T * QKVW * 2, hipMemcpyDeviceToHost));
+      CK(hipMemcpy(h_abbf, d_ab_a, (long)T * HV * 2, hipMemcpyDeviceToHost));
+      for (long i = 0; i < (long)T * HV; i++) h_af[i] = h_bf16f(h_abbf[i]);
+      CK(hipMemcpy(h_abbf, d_ab_b, (long)T * HV * 2, hipMemcpyDeviceToHost));
+      for (long i = 0; i < (long)T * HV; i++) h_bf[i] = h_bf16f(h_abbf[i]);
+      double ts = now_s();
+      gdn_scan(T, h_qkvbf, h_af, h_bf, gi, h_co);
+      double tscan = now_s() - ts;
+      if (g_dbg) {
+        double qm = 0, cm = 0, am = 0, bm = 0;
+        for (long i = 0; i < (long)T * QKVW; i++) {
+          float v = h_bf16f(h_qkvbf[i]);
+          if (fabs(v) > qm) qm = fabs(v);
+        }
+        for (long i = 0; i < (long)T * HV * DV; i++) {
+          float v = h_bf16f(h_co[i]);
+          if (fabs(v) > cm) cm = fabs(v);
+        }
+        for (long i = 0; i < (long)T * HV; i++) {
+          am = fmax(am, fabs(h_af[i]));
+          bm = fmax(bm, fabs(h_bf[i]));
+        }
+        printf("  L%d gdn: qkvconv_max=%.3g co_max=%.3g a_max=%.3g b_max=%.3g g0=%.4g beta0=%.4g\n",
+               l, qm, cm, am, bm,
+               -expf(h_alog[(long)gdn_ord(l) * HV]) * softplusf(h_af[0] + h_dtbias[(long)gdn_ord(l) * HV]),
+               1.f / (1.f + expf(-h_bf[0])));
+      }
+      up(d_co, h_co, (long)T * HV * DV * 2);
+      k_gdn_gatednorm<<<GRID1((long)T * HV), 256>>>(d_co, d_zout, d_gdn_norm + (long)gi * DV, d_gn, T);
+      gemm(d_gn, d_outp, d_tmp1, T, HID, HV * DV);
+      if (g_dbg) { dbg_all("zout", d_zout, T, HV * DV); dbg_all("gn", d_gn, T, HV * DV); dbg_all("gdn_attnout", d_tmp1, T, HID); }
+      if (getenv("HALO_TIME")) printf("  L%d gdn load %.2fs scan %.3fs\n", l, tload, tscan);
+    } else {
+      // ---- FA branch ----
+      gemm(d_ln1, d_q, d_qg, T, QH * HD * 2, HID);
+      gemm(d_ln1, d_k, d_kk, T, KVH * HD, HID);
+      gemm(d_ln1, d_v, d_vv, T, KVH * HD, HID);
+      k_headnorm<<<GRID1((long)T * QH), 256>>>(d_qg, d_qnorm + (long)gi * HD, d_qn, T, QH, QH * HD * 2, HD);
+      k_headnorm<<<GRID1((long)T * KVH), 256>>>(d_kk, d_knorm + (long)gi * HD, d_kn, T, KVH, KVH * HD, HD);
+      k_rope<<<GRID1((long)T * QH * NPAIR), 256>>>(d_qn, T, QH, pos_base, ROPE_MODE);
+      k_rope<<<GRID1((long)T * KVH * NPAIR), 256>>>(d_kn, T, KVH, pos_base, ROPE_MODE);
+      uint16_t* kc = d_kcache + (long)gi * CXT * KVH * HD;
+      uint16_t* vc = d_vcache + (long)gi * CXT * KVH * HD;
+      k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_kn, kc, T, pos_base);
+      k_kvwrite<<<GRID1((long)T * KVH * HD), 256>>>(d_vv, vc, T, pos_base);
+      if (T > 1) {
+        k_attn_scores<<<GRID1((long)QH * T * T), 256>>>(d_qn, kc, d_scores, T, CXT);
+        k_attn_softmax<<<GRID1((long)QH * T), 256>>>(d_scores, d_pbf, T, CXT);
+        k_attn_pv<<<GRID1((long)T * QH * HD), 256>>>(d_pbf, vc, d_att, T, CXT);
+      } else {
+        k_attn_step<<<QH, 256>>>(d_qn, kc, vc, d_att, pos_base);
+      }
+      k_fa_gate<<<GRID1((long)T * QH * HD), 256>>>(d_att, d_qg, T);
+      gemm(d_att, d_o, d_tmp1, T, HID, QH * HD);
+      if (g_dbg) dbg_all("q_rope", d_qn, T, QH * HD);
+    }
+    k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
+
+    // ---- MLP ----
+    k_rmsnorm<<<T, 256>>>(d_x, d_ln_post_all + (long)l * HID, d_ln2, HID, T, 1);
+    if (g_dbg) dbg_all("ln2", d_ln2, T, HID);
+    gemm(d_ln2, d_gate, d_g17, T, INTM, HID);
+    gemm(d_ln2, d_up, d_u17, T, INTM, HID);
+    if (g_dbg) { dbg_all("g17", d_g17, T, INTM); dbg_all("u17", d_u17, T, INTM); }
+    k_silu_mul<<<GRID1((long)T * INTM), 256>>>(d_g17, d_u17, d_act, (long)T * INTM);
+    gemm(d_act, d_down, d_tmp1, T, HID, INTM);
+    if (g_dbg) { dbg_all("mlp_act", d_act, T, INTM); dbg_all("mlp_out", d_tmp1, T, HID); }
+    k_add<<<GRID1((long)T * HID), 256>>>(d_x, d_tmp1, d_x, (long)T * HID);
+    CK(hipDeviceSynchronize());
+    if (g_dbg) { printf("after L%d (%s):\n", l, fa ? "fa" : "gdn"); dbg_all("x", d_x, T, HID); }
+    if (getenv("HALO_TIME")) printf("  L%d load %.2fs compute %.2fs\n", l, tload, now_s() - tc);
+  }
+  if (want_logits) {
+    k_rmsnorm<<<T, 256>>>(d_x, d_final_norm, d_ln1, HID, T, 1);
+    gemm_f32(d_ln1, d_lmhead, d_logits, T, VOC, HID);
+    CK(hipDeviceSynchronize());
+    if (g_dbg) { printf("final:\n"); dbg_row("finalnorm", d_ln1, 0, HID); dbg_f32("logits", d_logits, 0, VOC); }
+  } else {
+    CK(hipDeviceSynchronize());
+  }
+}
+
+// ================= main =================
+int main(int argc, char** argv) {
+  const char* mode = argc > 1 ? argv[1] : "tf";
+  if (getenv("HALO_ROPE")) ROPE_MODE = atoi(getenv("HALO_ROPE"));
+  if (getenv("HALO_DEBUG")) g_dbg = 1;
+  if (getenv("HALO_STEPS")) g_steps = 1;
+
+  int ndev; CK(hipGetDeviceCount(&ndev));
+  if (ndev < 1) { printf("no HIP device\n"); return 1; }
+  CK(hipSetDevice(0));
+
+  double t0 = now_s();
+  g_f = fopen(CKPT, "rb");
+  if (!g_f) { printf("cannot open %s\n", CKPT); return 1; }
+  load_table();
+  printf("table: %zu tensors\n", g_tbl.size());
+
+  CK(hipHostMalloc(&h_stage, 64 << 20));
+  CK(hipHostMalloc(&h_stage2, 1 << 20));
+  CK(hipMalloc(&d_raw, 64 << 20));
+  CK(hipMalloc((void**)&d_raws, 1 << 19));
+  CK(hipMalloc((void**)&d_cb, 64));
+
+  CK(hipMalloc((void**)&d_embed, (long)VOC * HID * 2));
+  printf("loading embed...\n"); load_bf16("embed_tokens.weight", (long)VOC * HID * 2, d_embed);
+  CK(hipMalloc((void**)&d_lmhead, (long)VOC * HID * 2));
+  printf("loading lm_head (fp8r dequant)...\n"); load_fp8r("lm_head.weight", VOC, HID, d_lmhead);
+  CK(hipDeviceSynchronize());
+  printf("big tensors loaded (%.1fs)\n", now_s() - t0);
+
+  // small tensors, all layers
+  CK(hipMalloc((void**)&d_ln_in_all, (long)NL * HID * 2));
+  CK(hipMalloc((void**)&d_ln_post_all, (long)NL * HID * 2));
+  for (int l = 0; l < NL; l++) {
+    snprintf(nm, sizeof(nm), "layers.%d.input_layernorm.weight", l);
+    load_bf16(nm, HID * 2, d_ln_in_all + (long)l * HID);
+    snprintf(nm, sizeof(nm), "layers.%d.post_attention_layernorm.weight", l);
+    load_bf16(nm, HID * 2, d_ln_post_all + (long)l * HID);
+  }
+  CK(hipMalloc((void**)&d_final_norm, HID * 2)); load_bf16("norm.weight", HID * 2, d_final_norm);
+  CK(hipMalloc((void**)&d_gdn_conv, (long)48 * QKVW * 4 * 2));
+  CK(hipMalloc((void**)&d_gdn_a, (long)48 * HV * HID * 2));
+  CK(hipMalloc((void**)&d_gdn_b, (long)48 * HV * HID * 2));
+  CK(hipMalloc((void**)&d_gdn_norm, (long)48 * DV * 2));
+  h_alog = (float*)malloc((long)48 * HV * 4);
+  h_dtbias = (float*)malloc((long)48 * HV * 4);
+  { int gi = 0;
+    for (int l = 0; l < NL; l++) {
+      if (l % 4 == 3) continue;
+      snprintf(nm, sizeof(nm), "layers.%d.linear_attn.conv1d.weight", l);
+      load_bf16(nm, (long)QKVW * 4 * 2, d_gdn_conv + (long)gi * QKVW * 4);
+      snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_a.weight", l);
+      load_bf16(nm, (long)HV * HID * 2, d_gdn_a + (long)gi * HV * HID);
+      snprintf(nm, sizeof(nm), "layers.%d.linear_attn.in_proj_b.weight", l);
+      load_bf16(nm, (long)HV * HID * 2, d_gdn_b + (long)gi * HV * HID);
+      snprintf(nm, sizeof(nm), "layers.%d.linear_attn.norm.weight", l);
+      load_bf16(nm, DV * 2, d_gdn_norm + (long)gi * DV);
+      const Ent* e = find((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.A_log", l), nm));
+      rd(e->off, h_stage2, 96);
+      { uint16_t* u = (uint16_t*)h_stage2;
+        for (int i = 0; i < HV; i++) h_alog[(long)gi * HV + i] = h_bf16f(u[i]); }
+      e = find((snprintf(nm, sizeof(nm), "layers.%d.linear_attn.dt_bias", l), nm));
+      rd(e->off, h_stage2, 96);
+      { uint16_t* u = (uint16_t*)h_stage2;
+        for (int i = 0; i < HV; i++) h_dtbias[(long)gi * HV + i] = h_bf16f(u[i]); }
+      gi++;
+    } }
+  CK(hipMalloc((void**)&d_qnorm, (long)16 * HD * 2));
+  CK(hipMalloc((void**)&d_knorm, (long)16 * HD * 2));
+  { int fi = 0;
+    for (int l = 0; l < NL; l++) {
+      if (l % 4 != 3) continue;
+      snprintf(nm, sizeof(nm), "layers.%d.self_attn.q_norm.weight", l); load_bf16(nm, HD * 2, d_qnorm + (long)fi * HD);
+      snprintf(nm, sizeof(nm), "layers.%d.self_attn.k_norm.weight", l); load_bf16(nm, HD * 2, d_knorm + (long)fi * HD);
+      fi++;
+    } }
+  printf("small tensors loaded\n");
+
+  CK(hipMalloc((void**)&d_qkv, (long)QKVW * HID * 2));
+  CK(hipMalloc((void**)&d_z, (long)HV * DV * HID * 2));
+  CK(hipMalloc((void**)&d_outp, (long)HID * HV * DV * 2));
+  CK(hipMalloc((void**)&d_q, (long)QH * HD * 2 * HID * 2));
+  CK(hipMalloc((void**)&d_k, (long)KVH * HD * HID * 2));
+  CK(hipMalloc((void**)&d_v, (long)KVH * HD * HID * 2));
+  CK(hipMalloc((void**)&d_o, (long)HID * QH * HD * 2));
+  CK(hipMalloc((void**)&d_gate, (long)INTM * HID * 2));
+  CK(hipMalloc((void**)&d_up, (long)INTM * HID * 2));
+  CK(hipMalloc((void**)&d_down, (long)HID * INTM * 2));
+
+  CK(hipMalloc((void**)&d_convstate, (long)48 * QKVW * 3 * 2));
+  CK(hipMemset(d_convstate, 0, (long)48 * QKVW * 3 * 2));
+  CK(hipMalloc((void**)&d_kcache, (long)16 * CXT * KVH * HD * 2));
+  CK(hipMalloc((void**)&d_vcache, (long)16 * CXT * KVH * HD * 2));
+  CK(hipMemset(d_kcache, 0, (long)16 * CXT * KVH * HD * 2));
+  CK(hipMemset(d_vcache, 0, (long)16 * CXT * KVH * HD * 2));
+  h_S = (float*)calloc((long)48 * HV * DK * DV, 4);
+
+  CK(hipMalloc((void**)&d_x, (long)TMAX * HID * 2));
+  CK(hipMalloc((void**)&d_ln1, (long)TMAX * HID * 2));
+  CK(hipMalloc((void**)&d_ln2, (long)TMAX * HID * 2));
+  CK(hipMalloc((void**)&d_tmp1, (long)TMAX * HID * 2));
+  CK(hipMalloc((void**)&d_qkvraw, (long)TMAX * QKVW * 2));
+  CK(hipMalloc((void**)&d_qkvc, (long)TMAX * QKVW * 2));
+  CK(hipMalloc((void**)&d_ab_a, (long)TMAX * HV * 2));
+  CK(hipMalloc((void**)&d_ab_b, (long)TMAX * HV * 2));
+  CK(hipMalloc((void**)&d_zout, (long)TMAX * HV * DV * 2));
+  CK(hipMalloc((void**)&d_co, (long)TMAX * HV * DV * 2));
+  CK(hipMalloc((void**)&d_gn, (long)TMAX * HV * DV * 2));
+  CK(hipMalloc((void**)&d_qg, (long)TMAX * QH * HD * 2 * 2));
+  CK(hipMalloc((void**)&d_kk, (long)TMAX * KVH * HD * 2));
+  CK(hipMalloc((void**)&d_vv, (long)TMAX * KVH * HD * 2));
+  CK(hipMalloc((void**)&d_att, (long)TMAX * QH * HD * 2));
+  CK(hipMalloc((void**)&d_qn, (long)TMAX * QH * HD * 2));
+  CK(hipMalloc((void**)&d_kn, (long)TMAX * KVH * HD * 2));
+  CK(hipMalloc((void**)&d_g17, (long)TMAX * INTM * 2));
+  CK(hipMalloc((void**)&d_u17, (long)TMAX * INTM * 2));
+  CK(hipMalloc((void**)&d_act, (long)TMAX * INTM * 2));
+  CK(hipMalloc((void**)&d_scores, (long)QH * CXT * CXT * 4));
+  CK(hipMalloc((void**)&d_pbf, (long)QH * CXT * CXT * 2));
+  CK(hipMalloc((void**)&d_logits, (long)TMAX * VOC * 4));
+  CK(hipMalloc((void**)&d_tok, TMAX * 4));
+  CK(hipMalloc((void**)&d_tgt, TMAX * 4));
+  CK(hipMalloc((void**)&d_pred, TMAX * 4));
+  CK(hipMalloc((void**)&d_nll, TMAX * 4));
+
+  h_qkvbf = (uint16_t*)malloc((long)TMAX * QKVW * 2);
+  h_abbf = (uint16_t*)malloc((long)TMAX * HV * 2);
+  h_af = (float*)malloc((long)TMAX * HV * 4);
+  h_bf = (float*)malloc((long)TMAX * HV * 4);
+  h_co = (uint16_t*)malloc((long)TMAX * HV * DV * 2);
+  h_qscale = 1.0f / sqrtf((float)DK);
+
+  // ---- prompt ----
+  { FILE* pf = fopen("/tmp/prompt_ids.json", "rb");
+    if (!pf) { printf("no prompt file\n"); return 1; }
+    static char buf[8192]; size_t n = fread(buf, 1, sizeof(buf) - 1, pf); buf[n] = 0; fclose(pf);
+    h_prompt = (int*)malloc(TMAX * 4); h_nprompt = 0;
+    for (char* p = buf; *p; p++) {
+      if (*p >= '0' && *p <= '9') {
+        long v = 0; while (*p >= '0' && *p <= '9') { v = v * 10 + (*p - '0'); p++; }
+        h_prompt[h_nprompt++] = (int)v; p--;
+      }
+    }
+    printf("prompt: %d tokens\n", h_nprompt);
+  }
+  up(d_tok, h_prompt, h_nprompt * 4);
+
+  // ================= prefill =================
+  double tp = now_s();
+  int cmp_mode = 0;   // 0: none, 1: u16-seq mapping (rows 4i+3), 2: i32 mapping (rows i)
+  if (strcmp(mode, "tf") == 0) {
+    // The original --forced reads the 348-byte prompt_ids tensor as u16 tokens:
+    // seq = [p0, hi0, p1, hi1, ...] (+ zero padding), dump row i = position 4i+3,
+    // tgt = seq[4i+4]. Reproduce exactly that.
+    static int seq[TMAX];
+    for (int k = 0; k < h_nprompt; k++) {
+      seq[2 * k] = h_prompt[k] & 0xFFFF;
+      seq[2 * k + 1] = (h_prompt[k] >> 16) & 0xFFFF;
+    }
+    up(d_tok, seq, 174 * 4);
+    forward(d_tok, 174, 0, 1);
+    cmp_mode = 1;
+  } else {
+    forward(d_tok, h_nprompt, 0, 1);
+    cmp_mode = 2;
+  }
+  printf("prefill: %.1fs\n", now_s() - tp);
+
+  // ---- teacher-forced reference (HFD2 dump from the original engine) ----
+  // 16-byte header {magic, 0, rows, 1}; rows of 16 B: {u32 pred, u32 tgt, f32 nll, i32 doc}
+  int refrows = 0;
+  static long refpred[256]; static long reftgt[256]; static float refnll[256];
+  { FILE* fd = fopen("/tmp/forced-text.bin", "rb");
+    if (!fd) { printf("no forced dump\n"); return 1; }
+    uint8_t hdr[16]; if (fread(hdr, 1, 16, fd) != 16) { printf("dump hdr\n"); return 1; }
+    refrows = hdr[8] | (hdr[9] << 8) | (hdr[10] << 16) | (hdr[11] << 24);
+    for (int i = 0; i < refrows; i++) {
+      uint8_t r[16]; if (fread(r, 1, 16, fd) != 16) break;
+      uint32_t p, t; memcpy(&p, r, 4); memcpy(&t, r + 4, 4);
+      float nl2; memcpy(&nl2, r + 8, 4);
+      refpred[i] = p; reftgt[i] = t; refnll[i] = nl2;
+    }
+    fclose(fd);
+  }
+  static int mytgt[256]; static int myrow[256];
+  int nvalid = 0;
+  for (int i = 0; i < refrows; i++) {
+    if (reftgt[i] != 0 && reftgt[i] < VOC) {
+      if (cmp_mode == 1) { myrow[nvalid] = 4 * i + 3; mytgt[nvalid] = h_prompt[2 * i + 2]; }
+      else               { myrow[nvalid] = i; mytgt[nvalid] = h_prompt[i + 1]; }
+      nvalid++;
+    }
+  }
+  printf("HFD2 rows=%d, valid rows=%d (cmp_mode=%d)\n", refrows, nvalid, cmp_mode);
+  up(d_tgt, mytgt, nvalid * 4);
+  up(d_tok, myrow, nvalid * 4);   // reuse d_tok as rowmap
+  k_topnll<<<nvalid, 256>>>(d_logits, d_tok, d_tgt, d_pred, d_nll, VOC, nvalid);
+  CK(hipDeviceSynchronize());
+  static int mypred[256]; static float mynll[256];
+  CK(hipMemcpy(mypred, d_pred, nvalid * 4, hipMemcpyDeviceToHost));
+  CK(hipMemcpy(mynll, d_nll, nvalid * 4, hipMemcpyDeviceToHost));
+
+  int top1 = 0, first_div = -1;
+  double nllsum = 0, refsum = 0, refsum86 = 0;
+  int reftop1_86 = 0;
+  for (int i = 0; i < refrows; i++) {
+    refsum86 += refnll[i];
+    if (refpred[i] == reftgt[i]) reftop1_86++;
+  }
+  for (int i = 0; i < nvalid; i++) {
+    nllsum += mynll[i]; refsum += refnll[i];
+    if (mypred[i] == mytgt[i]) top1++;
+    else if (first_div < 0) first_div = i;
+  }
+  printf("== teacher-forced ==\n");
+  printf("valid=%d top1=%d/%d (ref raw: %d/86) mean-NLL ours=%.6f ref=%.6f delta=%.6f first_div_row=%d\n",
+         nvalid, top1, nvalid, reftop1_86, nllsum / nvalid, refsum / nvalid,
+         nllsum / nvalid - refsum / nvalid, first_div);
+  printf("ref full-dump mean-NLL=%.6f (task ground truth 5.918531)\n", refsum86 / refrows);
+  for (int i = 0; i < 6; i++)
+    printf("  row%2d ourpos=%3d ours: pred=%d nll=%.4f | ref: pred=%ld tgt=%ld nll=%.4f\n",
+           i, myrow[i], mypred[i], mynll[i], refpred[i], reftgt[i], refnll[i]);
+  if (cmp_mode == 2 && nvalid > 0) {
+    // HFD2 rows are MTP-head drafts at even positions; the pred column should track
+    // the TRUNK argmax at position 2i. Check that (trunk-vs-trunk vs the original).
+    static int evenrow[256], eventgt[256];
+    int ne = 0;
+    for (int i = 0; i < refrows; i++) {
+      if (reftgt[i] != 0 && reftgt[i] < VOC && 2 * i + 2 < h_nprompt) {
+        evenrow[ne] = 2 * i;
+        eventgt[ne] = h_prompt[2 * i + 2];
+        ne++;
+      }
+    }
+    up(d_tgt, eventgt, ne * 4);
+    up(d_tok, evenrow, ne * 4);
+    k_topnll<<<ne, 256>>>(d_logits, d_tok, d_tgt, d_pred, d_nll, VOC, ne);
+    CK(hipDeviceSynchronize());
+    static int epred[256];
+    CK(hipMemcpy(epred, d_pred, ne * 4, hipMemcpyDeviceToHost));
+    int pm = 0, fdiv = -1;
+    for (int i = 0; i < ne; i++) {
+      if (epred[i] == refpred[i]) pm++;
+      else if (fdiv < 0) fdiv = i;
+    }
+    printf("trunk-argmax@even-pos vs HFD2 pred column: %d/%d match, first_div=%d\n", pm, ne, fdiv);
+  }
+  printf("total elapsed: %.1fs\n", now_s() - t0);
+
+  if (strcmp(mode, "tf") == 0) return 0;
+
+  // ================= greedy decode =================
+  static const int target[24] = {271, 51, 1618, 579, 1558, 369, 524, 15756, 264, 13263, 38896, 13,
+                                 1049, 369, 279, 15787, 314, 6278, 6165, 7785, 13, 6983, 15019, 3992};
+  int gen[24];
+  k_argmax1<<<1, 256>>>(d_logits + (long)(h_nprompt - 1) * VOC, d_pred, VOC);
+  CK(hipDeviceSynchronize());
+  CK(hipMemcpy(&gen[0], d_pred, 4, hipMemcpyDeviceToHost));
+  printf("greedy: ");
+  printf("%d", gen[0]);
+  int matches = 0, gdiv = -1;
+  if (gen[0] == target[0]) matches = 1; else gdiv = 0;
+  for (int s = 1; s < 24; s++) {
+    double td = now_s();
+    up(d_tok, &gen[s - 1], 4);
+    forward(d_tok, 1, h_nprompt - 1 + s, 1);
+    k_argmax1<<<1, 256>>>(d_logits, d_pred, VOC);
+    CK(hipDeviceSynchronize());
+    CK(hipMemcpy(&gen[s], d_pred, 4, hipMemcpyDeviceToHost));
+    if (g_steps) {
+      static float lrow[248320];
+      CK(hipMemcpy(lrow, d_logits, VOC * 4, hipMemcpyDeviceToHost));
+      int t1 = 0, t2 = 0; float v1 = -3e38f, v2 = -3e38f;
+      for (int v = 0; v < VOC; v++) {
+        if (lrow[v] > v1) { v2 = v1; t2 = t1; v1 = lrow[v]; t1 = v; }
+        else if (lrow[v] > v2) { v2 = lrow[v]; t2 = v; }
+      }
+      printf("  step%d pos%d: top1=%d(%.4f) top2=%d(%.4f) gap=%.4f\n", s, h_nprompt - 1 + s, t1, v1, t2, v2, v1 - v2);
+    }
+    printf(" %d", gen[s]); fflush(stdout);
+    if (getenv("HALO_TIME")) printf("[%.2fs] ", now_s() - td);
+    if (gdiv < 0) { if (gen[s] == target[s]) matches++; else gdiv = s; }
+  }
+  printf("\n== greedy ==\n");
+  printf("matches=%d/24 first_div_pos=%d\n", matches, gdiv);
+  printf("target: 271 51 1618 579 1558 369 524 15756 264 13263 38896 13 1049 369 279 15787 314 6278 6165 7785 13 6983 15019 3992\n");
+  return 0;
+}
