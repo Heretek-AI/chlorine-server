@@ -153,16 +153,46 @@ GPTQ act-order (data-dependent permutation), NOT the HF natural order.**
 The engine is self-consistent (its acts, actq, and gemm all use the file
 order), which is why it validates.
 
-**Recovery plan for the permutation P (next session)**: scale[n][c] =
-absmax(W[n, P-chunk c]) / ~7 (loose, with clipping). For each chunk c the
-feasible k-set = {k : |W[n,k]| ≤ 7·s[n][c] ∀ n} — with 5120 rows the
-feasible set per chunk should be ≈ exactly 256, yielding P nearly
-uniquely. (First probe with 512 rows: feasible counts 2484-3081 — too
-loose; the recovery needs all 5120 rows AND the 2-sided constraint that
-each chunk's subset contains an argmax k with |W[n,k]| = 7·s[n][c], which
-pins the set much harder.) After P: dequant = round-based GPTQ codes (sign-match expected
-0.85+), full reconstruction, then implement the emulated int4 gemm. The
-feasibility scan is 5120×17408 per chunk — vectorizable, ~seconds.
+**Recovery plan for the permutation P**: superseded — SOLVED 2026-09-09
+(late session). The "permutation" is not an act-order permutation at all:
+
+## I4L SOLVED: Hadamard-rotated int4 (QuaRot-style)
+
+The i4l tensor is the SAME weights quantized after an orthogonal 256-block
+Hadamard rotation. Element-wise it is uncorrelated with W (corr ≈ 0.001
+vs W, ≈ 0.002 vs q4c codes) but per-row energy is preserved to the
+quantization error (ratio 1.015-1.019), and blockwise reconstruction with
+the normalized Hadamard-256 gives corr(W_rec, W) = 0.9920-0.9924 across
+rows. Engine correctness follows: acts are rotated by the same H (the
+k_actq butterfly IS the fast Hadamard transform), so W'·a' = W·a exactly.
+
+**File layout (i4l, interleaved per row)**:
+- row n = [K/2 bytes of 4-bit two's-complement codes (lo nib = even k')]
+  ++ [2·(K/256) bytes of scales]: down_proj = 8704 + 136 B (row stride
+  8840); gate/up_proj = 2560 + 40 B (row stride 2600). Tensor size
+  N·(K/2 + 2K/256) exactly (45,260,800 for [5120,17408]).
+- scales = one fp16 per (n, 256-k' chunk): value = 8-bit mantissa ×
+  tensor-shared fixed exponent 2^-8 (bytes = [b, 0x1D] little-endian,
+  fp16(b | 0x1D00) = (1 + (256+b)/1024)·2^-8); scale = absmax(rotated
+  chunk)/7 EXACTLY (absmax/s = 7.000 at p1/p50/p99).
+- dequant: W'[n,k'] = code[n,k'] · s[n][k'>>8]
+- reconstruction: W[n, 256c:(c+1)·256] = W'[n, same] @ Hadamard256/16
+
+**Shadow tensors**: every i4l tensor has a same-dims q4c (dt=5) twin
+(e.g. layers.0.mlp.down_proj.weight dt=5 + .weight.i4l dt=8). q4c =
+UNROTATED linear int4 (corr 0.987, decode/gemv path); i4l = rotated copy
+(W4A4/prefill gemm path). Both loaded → the ~18 GB weight pool.
+
+**Hadamard details**: H256 = the standard unnormalized Hadamard (Sylvester)
+divided by 16; H symmetric so left/right multiply agree. corr peaks at
+shift 0 (shift-1 corr = 0.001), absmax/s = 7.000 post-hoc confirms both
+the chunking and the scale semantics. Residual 0.992 (not 1.0) = the
+4-bit quantization error only (q4c shows the same 0.987).
+
+**Probes**: /tmp/opencode/i4l_{kn,npair,permsweep,final*,split*,score,
+tileperm,rot,had,verify,entry,names}.py; kmap2.txt (full WMMA B-map sweep);
+q4c_dump.py; the dequant/gemv kernel decodes (obj5.so via
+/var/cache/lemonade/.../llvm-objdump).
 
 ## Validation summary
 
@@ -170,6 +200,7 @@ feasibility scan is 5120×17408 per chunk — vectorizable, ~seconds.
   absmax→448 scaling exact.
 - q4c: corr 0.987–0.988 vs base model rows 0–39 (int4 quantization error
   only); e4m3 scale bytes match LSQ-implied scales.
-- i4l: layout open (see above).
+- i4l: SOLVED — Hadamard-rotated int4, reconstruction corr 0.9920-0.9924
+  (rows 0-7, down_proj), scale = absmax(rot-chunk)/7 exact, layout above.
 - Base reference: `Qwen/Qwen3.8-27B` shard 1 on evileye at
   `~/Projects/models/qwen-base/`.
