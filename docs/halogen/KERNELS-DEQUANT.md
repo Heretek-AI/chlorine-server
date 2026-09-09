@@ -144,6 +144,26 @@ weight dtypes to bf16 at load (the u16-typed weights in k_gemv = PKt):
 codebook location + the exact scale addressing fall out of its addressing
 math directly.
 
+**Additional layout probes (2026-09-09, late)**: stride-8712 variant
+(8704 payload + 8 B in-row + 128-B/row tail block of 64 fp16 all-positive
+≈-scales) — the in-row 8 B is NOT fp16 scales (junk: 670, -9744, …);
+tail-64-fp16 sign-match also 0.41, and absmax/7-vs-scale ratios scatter
+0.78-1.31 — **the scales are for PERMUTED k-chunks: the file k-order =
+GPTQ act-order (data-dependent permutation), NOT the HF natural order.**
+The engine is self-consistent (its acts, actq, and gemm all use the file
+order), which is why it validates.
+
+**Recovery plan for the permutation P (next session)**: scale[n][c] =
+absmax(W[n, P-chunk c]) / ~7 (loose, with clipping). For each chunk c the
+feasible k-set = {k : |W[n,k]| ≤ 7·s[n][c] ∀ n} — with 5120 rows the
+feasible set per chunk should be ≈ exactly 256, yielding P nearly
+uniquely. (First probe with 512 rows: feasible counts 2484-3081 — too
+loose; the recovery needs all 5120 rows AND the 2-sided constraint that
+each chunk's subset contains an argmax k with |W[n,k]| = 7·s[n][c], which
+pins the set much harder.) After P: dequant = round-based GPTQ codes (sign-match expected
+0.85+), full reconstruction, then implement the emulated int4 gemm. The
+feasibility scan is 5120×17408 per chunk — vectorizable, ~seconds.
+
 ## Validation summary
 
 - fp8r: reproduced base-model row0 exactly (std 0.01735 / absmax 0.06885);
