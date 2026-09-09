@@ -1,0 +1,19 @@
+# chlorine-server working tree — do not publish
+review/
+models/
+*.hgn
+*.fatbin
+
+# build
+build/
+out/
+*.o
+*.obj
+
+# python
+__pycache__/
+*.pyc
+.venv/
+
+# caches
+.cache/
