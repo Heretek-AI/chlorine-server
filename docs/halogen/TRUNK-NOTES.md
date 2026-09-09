@@ -174,9 +174,25 @@ The `HALOGEN_W4A4` env value is **a row-count threshold**, not a bitflag:
   LOGPROBS appends ` %.9g` logprob to T lines. Verified live: greedy stream
   unchanged (271 51 1618…), seeded SAMPLE reproduces the decoded RNG (seed
   12345 → u=0.1133 → 198), BIAS −5 on 198/271 shifts the draw to 91170.
-- **Engine tie-break note**: the forced-bench row 85 has 198 and 271 at an
-  EXACT bf16 logit tie; the engine's argmax picks 198 (lower id) — k_argmax
-  tie order = first max in scan order.
+- **Draw scan order = PROB-DESC (sorted), not vocab order** — proven by a
+  seeded coin A/B (top_k=2, 100 seeds, 1-token GENs) against the original
+  server on 8730: with the vocab-order scan our server agreed 64/100; after
+  switching the support scan to (p desc, id asc) it agrees **90/100**, and
+  the sorted-order model with OUR u formula agrees 92/100 with the original.
+  The residual ≈ 10% = the serve-path logits difference (their clean-prefill
+  p(198)/p(271) ≈ 0.19/0.62 vs our 0.136/0.639 — the tail probs diverge well
+  beyond the ±0.005 mean-NLL), NOT an RNG difference: the original is
+  deterministic in seed across server restarts, and both head-rate and
+  mismatch pattern match the shared-u + shifted-table model exactly.
+- **Counter RNG confirmed identical** (b=0, u = (y>>40)·2^-24, posctr =
+  n_prompt + i, aux=0): the coin bit-strings line up position-for-position.
+  Multi-token A/B (3-token GENs): token-1 agreement ≈ 65/100 (table tails),
+  and token-2+ diverges even when token-1 matches (1/10) — the decode-step
+  logits differ (the Phase-A gemv/actq numerics gap), so full seeded stream
+  parity waits on Phase A, not on the sampler.
+- A/B artifacts: /tmp/opencode/ab_orig*.json, ab_ours*.json, coin_*.json,
+  multi_*.json; capture scripts ab_capture1.py / ab_coin.py / ab_multi.py;
+  fit scripts ab_fit*.py.
 
 ## 7. Engine integration notes
 

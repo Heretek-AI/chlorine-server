@@ -87,7 +87,7 @@ int samplecheck(int draws, int topk, float temp, float topp, float minp, int row
   }
   printf("  off-support draws: %d  (MUST be 0 - the sampler may only emit ids the filters kept)\n",
          offsup);
-  int shown = topk < 8 ? topk : 8;
+  int shown = getenv("HALO_SC_SHOW") ? atoi(getenv("HALO_SC_SHOW")) : 8;
   for (int r = 0; r < shown && r < (int)tbl.size(); r++) {
     double exp_p = tbl[r].second / kept;
     printf("  %-4d %-10d %.6f %.6f %.1f   ref: %d/%.6f\n", r, tbl[r].first, exp_p,
@@ -129,15 +129,23 @@ int main(int argc, char** argv) {
       }
     }
     printf("prompt: %d tokens\n", h_nprompt);
-    // forced-bench sequence: prompt[0], prompt[2], ... then zero pad = 87 tokens
+    // forced-bench sequence: prompt[0], prompt[2], ... then zero pad = 87
+    // tokens (HALO_SC_PLAIN=1: the plain serve prompt + last row instead)
     static int seq[TMAX];
     memset(seq, 0, sizeof(seq));
-    for (int j = 0; 2 * j < h_nprompt; j++) seq[j] = h_prompt[2 * j];
-    up(d_tok, seq, 87 * 4);
-    forward(d_tok, 87, 0, 1);
-    printf("prefill: %.1fs\n", now_s() - t0);
     int draws = getenv("HALO_DRAWS") ? atoi(getenv("HALO_DRAWS")) : 4000;
-    samplecheck(draws, 32, 1.0f, 0.f, 0.f, 85);
+    if (getenv("HALO_SC_PLAIN")) {
+      memcpy(seq, h_prompt, (size_t)h_nprompt * 4);
+      up(d_tok, seq, h_nprompt * 4);
+      forward(d_tok, h_nprompt, 0, 1);
+      samplecheck(draws, 32, 1.0f, 0.f, 0.f, h_nprompt - 1);
+    } else {
+      for (int j = 0; 2 * j < h_nprompt; j++) seq[j] = h_prompt[2 * j];
+      up(d_tok, seq, 87 * 4);
+      forward(d_tok, 87, 0, 1);
+      samplecheck(draws, 32, 1.0f, 0.f, 0.f, 85);
+    }
+    printf("prefill: %.1fs\n", now_s() - t0);
     printf("total elapsed: %.1fs\n", now_s() - t0);
     return 0;
   }
