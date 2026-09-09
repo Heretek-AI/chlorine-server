@@ -410,6 +410,89 @@ __global__ void k_silu_mul(const uint16_t* __restrict__ G, const uint16_t* __res
   Hh[i] = f32bf(bf16f(gb) * bf16f(U[i]));
 }
 
+// ---------------- i4l (Hadamard-rotated int4) ----------------
+// Weights stored as: N rows x K/2 bytes of 4-bit two's-complement codes
+// (lo nib = even col), then N x (K/256) fp16 scales. Dequant gives W'
+// (the rotated weights); W[n, 256c:(c+1)256] = W'[same] @ Hadamard256/16.
+// Acts are rotated by the same H before quantization (k_actq_had), so
+// fp16 GEMM on (a', W') equals the engine's int4 W4A4 products exactly.
+__device__ inline float fp16f(uint16_t h) {
+  uint32_t sign = (uint32_t)(h & 0x8000u) << 16;
+  uint32_t exp = (h >> 10) & 0x1Fu;
+  uint32_t man = h & 0x3FFu;
+  if (exp == 0) { float d = (float)man * (1.0f / 16777216.0f); return sign ? -d : d; }
+  if (exp == 31) return man ? nanf("1") : (sign ? -INFINITY : INFINITY);
+  uint32_t u = sign | ((exp - 15 + 127) << 23) | (man << 13);
+  return __uint_as_float(u);
+}
+
+__global__ void k_dequant_i4l(const uint8_t* __restrict__ pay,
+                              const uint16_t* __restrict__ sc,
+                              uint16_t* __restrict__ out, int cols, long nr) {
+  long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
+  long n = nr * (long)cols;
+  if (i >= n) return;
+  int col = (int)(i % cols);
+  long row = i / cols;
+  uint8_t b = pay[row * (cols >> 1) + (col >> 1)];
+  int nib = (col & 1) ? (int)(b >> 4) : (int)(b & 0xF);
+  int code = (nib > 7) ? nib - 16 : nib;
+  float s = fp16f(sc[row * (cols >> 8) + (col >> 8)]);
+  out[i] = f32bf((float)code * s);
+}
+
+// in-place Hadamard-256 along cols, per (row, 256-chunk): X = X @ H/16
+__global__ void k_had_cols(uint16_t* __restrict__ X) {
+  __shared__ float sh[256];
+  int tid = threadIdx.x;
+  long base = (long)blockIdx.x * 256;
+  sh[tid] = bf16f(X[base + tid]);
+  __syncthreads();
+  for (int len = 1; len < 256; len <<= 1) {
+    float a = sh[tid], b = sh[tid ^ len];
+    __syncthreads();
+    sh[tid] = ((tid & len) ? b - a : a + b);
+    __syncthreads();
+  }
+  X[base + tid] = f32bf(sh[tid] * (1.0f / 16.0f));
+}
+
+// W4A4 exact act-quant emulation: H-rotate the row's 256-chunk, quantize
+// with chunk scale absmax/7, rotate back. X ends as H(quant(H x)).
+__global__ void k_actq_had(uint16_t* __restrict__ X) {
+  __shared__ float sh[256], sm[256];
+  int tid = threadIdx.x;
+  long base = (long)blockIdx.x * 256;
+  sh[tid] = bf16f(X[base + tid]);
+  __syncthreads();
+  for (int len = 1; len < 256; len <<= 1) {
+    float a = sh[tid], b = sh[tid ^ len];
+    __syncthreads();
+    sh[tid] = ((tid & len) ? b - a : a + b);
+    __syncthreads();
+  }
+  float v = sh[tid] * (1.0f / 16.0f);
+  sm[tid] = fabsf(v);
+  __syncthreads();
+  for (int off = 128; off > 0; off >>= 1) {
+    if (tid < off) sm[tid] = fmaxf(sm[tid], sm[tid + off]);
+    __syncthreads();
+  }
+  float scale = bf16f(f32bf(sm[0] / 7.0f));
+  if (scale <= 0.f) scale = 1.0f;
+  float q = rintf(v / scale);
+  q = fminf(fmaxf(q, -8.f), 7.f);
+  sh[tid] = q * scale;
+  __syncthreads();
+  for (int len = 1; len < 256; len <<= 1) {
+    float a = sh[tid], b = sh[tid ^ len];
+    __syncthreads();
+    sh[tid] = ((tid & len) ? b - a : a + b);
+    __syncthreads();
+  }
+  X[base + tid] = f32bf(sh[tid] * (1.0f / 16.0f));
+}
+
 // ---------------- logits reduction ----------------
 __global__ void k_bf16logits(float* Lg, long n) {
   long i = blockIdx.x * (long)blockDim.x + threadIdx.x;
@@ -525,6 +608,29 @@ static void load_q4c(const char* name, long rows, long cols, uint16_t* d_out) {
     CK(hipDeviceSynchronize());
   }
 }
+// i4l -> device bf16 (unrotated W'), row-chunked:
+//   [N x K/2 code bytes][N x (K/256) fp16 scales]
+static void load_i4l(const char* name, long rows, long cols, uint16_t* d_out) {
+  const Ent* e = find(name);
+  long per = cols >> 1;
+  long nsc = cols >> 8;
+  long chunk = (long)(24e6 / per); if (chunk < 1) chunk = 1;
+  for (long r0 = 0; r0 < rows; r0 += chunk) {
+    long nr = chunk < rows - r0 ? chunk : rows - r0;
+    rd(e->off + r0 * per, h_stage, (size_t)nr * per);
+    up(d_raw, h_stage, (size_t)nr * per);
+    rd(e->off + rows * per + r0 * nsc * 2, h_stage2, (size_t)nr * nsc * 2);
+    up(d_raws, h_stage2, (size_t)nr * nsc * 2);
+    long n = nr * cols;
+    k_dequant_i4l<<<GRID1(n), 256>>>(d_raw, d_raws, d_out + r0 * cols, (int)cols, nr);
+    k_had_cols<<<(unsigned)(nr * (cols >> 8)), 256>>>(d_out + r0 * cols);
+    CK(hipDeviceSynchronize());
+  }
+}
+static const Ent* try_find(const char* name) {
+  for (auto& e : g_tbl) if (strcmp(e.name, name) == 0) return &e;
+  return nullptr;
+}
 static void load_bf16(const char* name, long bytes, void* d_out) {
   const Ent* e = find(name);
   long chunk = 32 << 20;
@@ -562,6 +668,8 @@ static bool pool_add(const char* name, long rows, long cols) {
   return true;
 }
 
+static int g_prefill = 0;  // 1 = multi-token forward: use Hadamard-rotated i4l weights
+
 static void getw(const char* name, long rows, long cols, uint16_t* d_out) {
   auto it = g_wmap.find(name);
   if (it != g_wmap.end()) {
@@ -575,6 +683,11 @@ static void getw(const char* name, long rows, long cols, uint16_t* d_out) {
                                         (const uint16_t*)(d_wpool + w.off + (size_t)rows * cols),
                                         d_out, cols);
     return;
+  }
+  if (g_prefill) {
+    char nm2[176];
+    snprintf(nm2, sizeof(nm2), "%s.i4l", name);
+    if (try_find(nm2)) { load_i4l(nm2, rows, cols, d_out); return; }
   }
   load_auto(name, rows, cols, d_out);
 }
@@ -874,6 +987,7 @@ static void gdn_scan(int T, const uint16_t* qkvbf, const float* af, const float*
 // ---------------- forward ----------------
 // T tokens at positions pos_base..; logits [T][VOC] f32 in d_logits when want_logits
 static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
+  g_prefill = (T > 1);
   k_embed<<<GRID1((long)T * HID), 256>>>(d_tokens, d_embed, d_x, HID);
   CK(hipDeviceSynchronize());
   if (g_dbg) { printf("after embed:\n"); dbg_row("embed", d_x, 0, HID); }
@@ -1004,7 +1118,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     // ---- MLP ----
     k_rmsnorm<<<T, 256>>>(d_x, d_ln_post_all + (long)l * HID, d_ln2, HID, T, 1);
     if (g_dbg) dbg_all("ln2", d_ln2, T, HID);
-    if (g_actq & 2) k_actq<<<T, 256>>>(d_ln2, HID, 0);
+    if (g_actq & 2) k_actq_had<<<(unsigned)((long)T * (HID / 256)), 256>>>(d_ln2);
     if (fused) {
       snprintf(nm, sizeof(nm), "layers.%d.mlp.gate_proj.weight", l); gemv_dq(d_ln2, nm, d_g17);
       snprintf(nm, sizeof(nm), "layers.%d.mlp.up_proj.weight", l);   gemv_dq(d_ln2, nm, d_u17);
@@ -1014,7 +1128,7 @@ static void forward(const int* d_tokens, int T, int pos_base, int want_logits) {
     }
     if (g_dbg) { dbg_all("g17", d_g17, T, INTM); dbg_all("u17", d_u17, T, INTM); }
     k_silu_mul<<<GRID1((long)T * INTM), 256>>>(d_g17, d_u17, d_act, (long)T * INTM);
-    if (g_actq & 1) k_actq<<<T, 256>>>(d_act, INTM, 0);
+    if (g_actq & 1) k_actq_had<<<(unsigned)((long)T * (INTM / 256)), 256>>>(d_act);
     if (fused) {
       snprintf(nm, sizeof(nm), "layers.%d.mlp.down_proj.weight", l); gemv_dq(d_act, nm, d_tmp1);
     } else {
