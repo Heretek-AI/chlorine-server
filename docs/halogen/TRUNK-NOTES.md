@@ -228,20 +228,46 @@ correction; i32 D accumulator.
   samplecheck/greedy currently fail on the second/third runs (chi2 1.909 vs
   1.063 first run) — same suspicion.
 
-### Trunk status vs engine (2026-09-09)
+### conv1d bit-exact (2026-09-10): k_conv1d_silu_t<256> asm decoded, 100% vs engine
 
-- tf: **5.810357** (exact W4A4 + bit-exact dequant staging, HALO_ACTQ=3) vs
-  engine 5.918531 (Δ-0.108); older values: 5.777286 (pre-dequant-fix), per-row
-  emu 5.940590, per-256-rotated emu 5.602123.
-- samplecheck: chi2/df **0.78-1.91 run-dependent** (reference 0.990) — the
-  decode path shows run-to-run non-determinism; under investigation.
-- greedy prefix 5/5 (first run) / 3/5 (later runs, one token differs: 725 vs
-  579 at pos 3) — same non-det investigation.
-- tf top1 **4-7/86** across reruns vs engine 5/86 — pure chaos-band (pad-row
-  coin flips); gate = 2 pending stability.
-- Residual-stream diffs vs engine: embed exact; L0 GDN out rms 1.4e-5.
-- Serve prefill appears to run the gemv (sub-threshold) route, which is why
-  our clean prefill matches the serve stream and not the bench dump.
+- Engine kernel: one thread per channel, per-time unrolled; taps are an
+  **fma chain oldest→newest**: `acc = fma(x[t-3],w0,0)` then 3×
+  `v_fmac_f32` (x[t-2]·w1, x[t-1]·w2, x[t]·w3). Weights read as one b64
+  per channel (`Wc[c*4+j]`, per-channel contiguous); history for t<3 comes
+  from a 3-row state buffer (zeros on a cold chunk = our zero-pad).
+- **silu input is the raw f32 acc** — no intermediate bf16 rounding of acc;
+  single bf16 round at store (v_add3 RNE). Division is
+  `acc * (1/(1+expf(-acc)))`: correctly-rounded reciprocal (div_scale/rcp/
+  2×fma/div_fixup) then a **separate mul** — our `acc/(1+exp)` single-rounding
+  differed by 1 ULP. expf = libdevice v_exp_f32 (+ldexp, ±inf/0 cndmasks at
+  y≥100.46 / y<-88.72) — same libdevice we link.
+- Fix in `k_conv1d`/`k_conv1d_step`: explicit `fmaf` chain, drop the
+  acc→bf16 round-trip, reciprocal+mul form. **conv output = 2048/2048
+  bit-exact vs engine CV dump** given the engine's own qkvraw (was 68.7%).
+- Engine launches it as grid=(1,40) block 256 for every T (thread=channel,
+  time loop inside) — the T=1 decode path uses the same kernel, so
+  `k_conv1d_step` shares the exact semantics (verified same asm shape).
+- Gates after fix: tf 5.84298 (Δ-0.076, closer to engine truth), samplecheck
+  chi2 1.046 + off-support 0, top1 4/2; greedy 3/5 (token 3: 725 vs 579
+  near-tie) — decode path still has ULP sources (fused decode gemv
+  accumulation vs the engine's T=1 BLASLt, scan fma order).
+
+### Trunk status vs engine (2026-09-10)
+
+- tf: **5.842980** (Δ-0.076; conv bit-exact) vs engine 5.918531; history:
+  5.810357 (pre-conv), 5.777286 (pre-dequant-fix), per-row emu 5.940590,
+  per-256-rotated emu 5.602123.
+- samplecheck: chi2/df **1.046**, off-support 0 (bf16 expected-table fix in
+  06a4141; the earlier 0.78-1.91 spread was the run-1/run-2 spelling diff,
+  resolved as ULP-different binaries, not non-determinism).
+- greedy prefix **3/5** (token 3: 725 vs 579 near-tie) — decode-path ULPs
+  remain: fused decode gemv accumulation vs the engine's T=1 BLASLt, scan
+  fma order; serve-path GEN protocol + engine greedy stream verified
+  (271 51 1618 579 ... 3992) against `greedy_text_87.json`.
+- tf top1 **4/86** (chaos band; gate 2) — hash df2bc736835c vs recorded
+  6be127062a76 (both chaos-band artifacts).
+- Residual-stream diffs vs engine: embed exact; L0 GDN out rms 1.39e-5
+  (conv now exact; remainder = gemm wmma tie 0.32% + scan fma order).
 
 ## 9. Sampler (implemented 2026-09 session)
 

@@ -226,23 +226,21 @@ __global__ void k_conv1d(const uint16_t* __restrict__ X, const uint16_t* __restr
   float acc = 0.f;
   for (int j = 0; j < 4; j++) {
     int tt = t + j - 3;
-    if (tt >= 0) acc += bf16f(Wc[c * 4 + j]) * bf16f(X[(long)tt * QKVW + c]);
+    if (tt >= 0) acc = fmaf(bf16f(Wc[c * 4 + j]), bf16f(X[(long)tt * QKVW + c]), acc);
   }
-  uint16_t yb = f32bf(acc);
-  float yf = bf16f(yb);
-  O[i] = f32bf(yf / (1.0f + expf(-yf)));
+  float inv = 1.0f / (1.0f + expf(-acc));
+  O[i] = f32bf(acc * inv);
 }
 __global__ void k_conv1d_step(const uint16_t* __restrict__ X, const uint16_t* __restrict__ Wc,
                               uint16_t* __restrict__ O, uint16_t* __restrict__ st) {
   int c = blockIdx.x * blockDim.x + threadIdx.x;
   if (c >= QKVW) return;
-  float acc = bf16f(st[c * 3 + 0]) * bf16f(Wc[c * 4 + 0])
-            + bf16f(st[c * 3 + 1]) * bf16f(Wc[c * 4 + 1])
-            + bf16f(st[c * 3 + 2]) * bf16f(Wc[c * 4 + 2])
-            + bf16f(X[c])          * bf16f(Wc[c * 4 + 3]);
-  uint16_t yb = f32bf(acc);
-  float yf = bf16f(yb);
-  O[c] = f32bf(yf / (1.0f + expf(-yf)));
+  float acc = fmaf(bf16f(st[c * 3 + 0]), bf16f(Wc[c * 4 + 0]), 0.0f);
+  acc = fmaf(bf16f(st[c * 3 + 1]), bf16f(Wc[c * 4 + 1]), acc);
+  acc = fmaf(bf16f(st[c * 3 + 2]), bf16f(Wc[c * 4 + 2]), acc);
+  acc = fmaf(bf16f(X[c]), bf16f(Wc[c * 4 + 3]), acc);
+  float inv = 1.0f / (1.0f + expf(-acc));
+  O[c] = f32bf(acc * inv);
   st[c * 3 + 0] = st[c * 3 + 1];
   st[c * 3 + 1] = st[c * 3 + 2];
   st[c * 3 + 2] = X[c];
